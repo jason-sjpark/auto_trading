@@ -3,136 +3,135 @@ import numpy as np
 from typing import Dict
 
 # ==============================================================
-# 🔧 Trade-based Feature Functions
+# 📈 Trade Feature Engineering (체결 데이터 기반)
+#  - 필수 컬럼: ['timestamp', 'price', 'qty', 'side']
+#  - trade_intensity = 초당 체결 '횟수'(Trades Per Second)
 # ==============================================================
 
-def calc_trade_intensity(df: pd.DataFrame, window_s: float = 1.0) -> float:
+def extract_trade_features(trades_df: pd.DataFrame, prev_avg_vol: float = 0.0) -> Dict[str, float]:
     """
-    거래 빈도(초당 체결 횟수)
+    체결 데이터 구간(윈도우)에서 다음 피처를 계산:
+      - trade_count       : 체결 횟수
+      - trade_intensity   : 초당 체결 횟수 (Trades Per Second)  ✅
+      - buy_sell_ratio    : 매수량 / (매수+매도)
+      - volume_delta      : 매수량 - 매도량
+      - vwap              : 체결가중 평균가
+      - trade_pressure    : (매수량-매도량) / (매수+매도)
+      - volume_spike      : 현재 체결량 / 직전 평균 체결량 (상한 10.0)
+
+    prev_avg_vol:
+      - 직전 구간의 총 체결량(선택). 0이면 현재 구간의 총 체결량으로 대체.
     """
-    if df.empty:
-        return 0.0
-    duration = (df["timestamp"].max() - df["timestamp"].min()).total_seconds()
-    if duration == 0:
-        return 0.0
-    return len(df) / duration
+    # 데이터 없음 처리
+    if trades_df is None or len(trades_df) == 0:
+        return {
+            "trade_count": 0.0,
+            "trade_intensity": 0.0,     # TPS
+            "buy_sell_ratio": 0.5,
+            "volume_delta": 0.0,
+            "vwap": 0.0,
+            "trade_pressure": 0.0,
+            "volume_spike": 0.0,
+        }
 
+    df = trades_df.copy()
 
-def calc_buy_sell_ratio(df: pd.DataFrame) -> float:
-    """
-    체결강도 (buy volume / total volume)
-    """
-    if df.empty:
-        return 0.5
-    buy_vol = df.loc[df["side"] == "buy", "qty"].sum()
-    sell_vol = df.loc[df["side"] == "sell", "qty"].sum()
-    total = buy_vol + sell_vol
-    if total == 0:
-        return 0.5
-    return buy_vol / total
+    # 필수 컬럼 보정
+    for col in ["timestamp", "price", "qty", "side"]:
+        if col not in df.columns:
+            # 누락되면 안전 기본값
+            if col == "timestamp":
+                df[col] = pd.Timestamp.utcnow()
+            elif col == "price" or col == "qty":
+                df[col] = 0.0
+            elif col == "side":
+                df[col] = "buy"
 
+    # 타입/결측 보정
+    df["timestamp"] = pd.to_datetime(df["timestamp"], errors="coerce")
+    df = df.dropna(subset=["timestamp", "price", "qty"]).reset_index(drop=True)
+    if len(df) == 0:
+        return {
+            "trade_count": 0.0,
+            "trade_intensity": 0.0,
+            "buy_sell_ratio": 0.5,
+            "volume_delta": 0.0,
+            "vwap": 0.0,
+            "trade_pressure": 0.0,
+            "volume_spike": 0.0,
+        }
 
-def calc_volume_delta(df: pd.DataFrame) -> float:
-    """
-    Volume Delta = buy volume - sell volume
-    """
-    if df.empty:
-        return 0.0
-    buy_vol = df.loc[df["side"] == "buy", "qty"].sum()
-    sell_vol = df.loc[df["side"] == "sell", "qty"].sum()
-    return buy_vol - sell_vol
+    df["price"] = pd.to_numeric(df["price"], errors="coerce").fillna(0.0)
+    df["qty"]   = pd.to_numeric(df["qty"],   errors="coerce").fillna(0.0)
+    df["side"]  = df["side"].astype(str).str.lower()
 
+    # 기본 통계
+    total_trades = int(len(df))
+    total_volume = float(df["qty"].sum())
+    df["amount"] = df["price"] * df["qty"]
 
-def calc_vwap(df: pd.DataFrame) -> float:
-    """
-    VWAP (체결가중 평균가격)
-    """
-    if df.empty:
-        return np.nan
-    return np.sum(df["price"] * df["qty"]) / np.sum(df["qty"])
+    buy_vol  = float(df.loc[df["side"] == "buy",  "qty"].sum())
+    sell_vol = float(df.loc[df["side"] == "sell", "qty"].sum())
 
+    # ⭐ 초당 체결 횟수(TPS)
+    # 구간 길이(초) = max(끝-시작, 아주 작은 값)
+    duration_sec = float(
+        max((df["timestamp"].max() - df["timestamp"].min()).total_seconds(), 1e-3)
+    )
+    trade_intensity = total_trades / duration_sec  # ✅ TPS (핵심 수정)
 
-def calc_volume_spike(df: pd.DataFrame, prev_avg_vol: float, factor: float = 2.0) -> float:
-    """
-    거래량 급증 여부 (이전 평균 대비 몇 배인지)
-    """
-    cur_vol = df["qty"].sum()
-    if prev_avg_vol == 0:
-        return 1.0
-    ratio = cur_vol / prev_avg_vol
-    return ratio if ratio > factor else 1.0
+    # 피처 계산
+    trade_count     = float(total_trades)
+    buy_sell_ratio  = buy_vol / (buy_vol + sell_vol + 1e-9)
+    volume_delta    = buy_vol - sell_vol
+    vwap            = float(df["amount"].sum()) / (total_volume + 1e-9)
+    trade_pressure  = (buy_vol - sell_vol) / (buy_vol + sell_vol + 1e-9)
 
+    # 거래량 급증(직전 대비) — prev_avg_vol=0이면 현재로 대체
+    base_vol = total_volume if prev_avg_vol == 0 else prev_avg_vol
+    volume_spike = (total_volume / (base_vol + 1e-9)) if base_vol > 0 else 1.0
+    volume_spike = float(min(volume_spike, 10.0))  # 상한
 
-def calc_trade_pressure(df: pd.DataFrame) -> float:
-    """
-    매수 vs 매도 체결 강도의 상대적 힘
-    - 값 > 0 → 매수 우위
-    - 값 < 0 → 매도 우위
-    """
-    if df.empty:
-        return 0.0
-    buy_vol = df.loc[df["side"] == "buy", "qty"].sum()
-    sell_vol = df.loc[df["side"] == "sell", "qty"].sum()
-    total = buy_vol + sell_vol
-    if total == 0:
-        return 0.0
-    return (buy_vol - sell_vol) / total
-
-
-# ==============================================================
-# 🧠 메인 Feature Extractor
-# ==============================================================
-
-def extract_trade_features(trades_df: pd.DataFrame, prev_avg_vol: float = 0.0) -> Dict:
-    """
-    단일 구간(예: 1초) 내 체결 데이터에서 피처 추출
-
-    | Feature           | 설명                 | 의미         |
-    | ----------------- | ------------------ | ---------- |
-    | `trade_count`     | 구간 내 체결 수          | 시장 활동도     |
-    | `trade_intensity` | 초당 거래 횟수           | 체결 속도      |
-    | `buy_sell_ratio`  | 매수 체결량 / 전체 체결량    | 매수세 강도     |
-    | `volume_delta`    | 매수 체결량 - 매도 체결량    | 매수/매도 순압력  |
-    | `vwap`            | 거래량 가중평균가          | 공정가 수준     |
-    | `trade_pressure`  | (매수-매도)/(총체결량)     | 순간 체결세력 지표 |
-    | `volume_spike`    | 이전 평균 대비 거래량 폭증 비율 | 이벤트성 거래 감지 |
-
-    """
     feats = {
-        "trade_count": len(trades_df),
-        "trade_intensity": calc_trade_intensity(trades_df),
-        "buy_sell_ratio": calc_buy_sell_ratio(trades_df),
-        "volume_delta": calc_volume_delta(trades_df),
-        "vwap": calc_vwap(trades_df),
-        "trade_pressure": calc_trade_pressure(trades_df),
-        "volume_spike": calc_volume_spike(trades_df, prev_avg_vol)
+        "trade_count": trade_count,
+        "trade_intensity": float(trade_intensity),  # ✅ TPS
+        "buy_sell_ratio": float(buy_sell_ratio),
+        "volume_delta": float(volume_delta),
+        "vwap": float(vwap),
+        "trade_pressure": float(trade_pressure),
+        "volume_spike": float(volume_spike),
     }
+
+    # NaN → 0 보정
+    for k, v in feats.items():
+        if v is None or (isinstance(v, float) and (np.isnan(v) or np.isinf(v))):
+            feats[k] = 0.0
+
+    # --- 런타임 검증(경고 로그) : 비정상치 감지 ---
+    # trade_intensity는 일반적으로 0~수백 TPS 범위
+    if feats["trade_intensity"] < 0 or feats["trade_intensity"] > 1e5:
+        print(f"[WARN] trade_intensity out of bounds: {feats['trade_intensity']:.3f} (duration={duration_sec:.4f}s, trades={total_trades})")
+
     return feats
 
 
 # ==============================================================
-# 🔬 테스트용 메인
+# 🔬 단독 테스트
 # ==============================================================
 
 if __name__ == "__main__":
-    import datetime
+    from datetime import datetime, timedelta
 
-    # 테스트용 가짜 데이터 생성
-    sample_data = {
-        "timestamp": pd.to_datetime([
-            "2025-10-17 09:00:00.100",
-            "2025-10-17 09:00:00.300",
-            "2025-10-17 09:00:00.700",
-            "2025-10-17 09:00:00.800"
-        ]),
-        "price": [54000.0, 54000.2, 54000.5, 54000.4],
-        "qty": [0.3, 0.5, 0.7, 0.4],
-        "side": ["buy", "buy", "sell", "sell"]
-    }
-
-    df = pd.DataFrame(sample_data)
-    feats = extract_trade_features(df, prev_avg_vol=1.0)
-
-    print("🧩 Trade Features:")
+    now = datetime.utcnow()
+    ts = [now + timedelta(milliseconds=i*100) for i in range(30)]  # 3초 동안 30건 → 10 TPS 기대
+    df = pd.DataFrame({
+        "timestamp": ts,
+        "price": np.linspace(100, 101, len(ts)),
+        "qty":   np.random.rand(len(ts)) * 0.5,
+        "side":  np.random.choice(["buy", "sell"], size=len(ts))
+    })
+    feats = extract_trade_features(df)
+    print("✅ Trade Features:")
     for k, v in feats.items():
-        print(f"  {k}: {v:.6f}")
+        print(f"  {k}: {v}")
+    # 기대: trade_count≈30, trade_intensity≈10.0 (±)

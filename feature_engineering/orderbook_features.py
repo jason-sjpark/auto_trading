@@ -1,129 +1,196 @@
 import numpy as np
 import pandas as pd
-from typing import Dict, List, Tuple
 
 # ==============================================================
-# 🔧 핵심 Feature 계산 함수들
+# 📊 호가창 기반 피처 계산 함수들
 # ==============================================================
 
-def calc_spread(bids: List[List[float]], asks: List[List[float]]) -> float:
-    """
-    스프레드 계산 (호가창 최상단 ask - bid)
-    """
-    if not bids or not asks:
-        return np.nan
-    best_bid = float(bids[0][0])
-    best_ask = float(asks[0][0])
-    spread = best_ask - best_bid
-    return spread
+def calc_spread(bids, asks):
+    """Best ask - best bid"""
+    try:
+        if bids is None or len(bids) == 0 or asks is None or len(asks) == 0:
+            return np.nan
+        if isinstance(bids, np.ndarray):
+            bids = bids.tolist()
+        if isinstance(asks, np.ndarray):
+            asks = asks.tolist()
 
-
-def calc_mid_price(bids: List[List[float]], asks: List[List[float]]) -> float:
-    """
-    미드프라이스 = (best bid + best ask) / 2
-    """
-    if not bids or not asks:
-        return np.nan
-    return (float(bids[0][0]) + float(asks[0][0])) / 2
-
-
-def calc_orderbook_imbalance(bids: List[List[float]], asks: List[List[float]], depth: int = 10) -> float:
-    """
-    호가 불균형: (Σbid_qty - Σask_qty) / (Σbid_qty + Σask_qty)
-    """
-    bids = np.array(bids[:depth], dtype=float)
-    asks = np.array(asks[:depth], dtype=float)
-
-    bid_vol = np.sum(bids[:, 1])
-    ask_vol = np.sum(asks[:, 1])
-    if bid_vol + ask_vol == 0:
-        return 0.0
-    imbalance = (bid_vol - ask_vol) / (bid_vol + ask_vol)
-    return imbalance
-
-
-def calc_order_wall_ratio(bids: List[List[float]], asks: List[List[float]], threshold_ratio: float = 0.2) -> float:
-    """
-    호가벽 비율 계산 (상위 몇 개 가격대에 전체 물량의 몇 %가 몰려 있는가)
-    예: 상위 2호가에 20% 이상 몰려 있으면 order wall 존재
-    """
-    bids = np.array(bids, dtype=float)
-    asks = np.array(asks, dtype=float)
-    total_bid_vol = np.sum(bids[:, 1])
-    total_ask_vol = np.sum(asks[:, 1])
-    if total_bid_vol == 0 or total_ask_vol == 0:
-        return 0.0
-
-    top2_bid_ratio = np.sum(bids[:2, 1]) / total_bid_vol
-    top2_ask_ratio = np.sum(asks[:2, 1]) / total_ask_vol
-    wall_ratio = (top2_bid_ratio + top2_ask_ratio) / 2
-    return wall_ratio
-
-
-def calc_liquidity_void(bids: List[List[float]], asks: List[List[float]], depth: int = 10) -> float:
-    """
-    유동성 공백(Liquidity void): 
-    호가창 간격의 평균 크기 / 스프레드 대비 비율
-    """
-    bids = np.array(bids[:depth], dtype=float)
-    asks = np.array(asks[:depth], dtype=float)
-
-    if len(bids) < 2 or len(asks) < 2:
+        best_bid = float(bids[0][0])
+        best_ask = float(asks[0][0])
+        return best_ask - best_bid
+    except Exception as e:
+        print(f"[calc_spread] Warning: {e}")
         return np.nan
 
-    bid_gaps = np.diff(bids[:, 0])
-    ask_gaps = np.diff(asks[:, 0])
-    avg_gap = (np.mean(np.abs(bid_gaps)) + np.mean(np.abs(ask_gaps))) / 2
-    spread = calc_spread(bids.tolist(), asks.tolist())
 
-    if spread == 0:
-        return 0.0
+def calc_mid_price(bids, asks):
+    """(best bid + best ask) / 2"""
+    try:
+        if bids is None or len(bids) == 0 or asks is None or len(asks) == 0:
+            return np.nan
+        if isinstance(bids, np.ndarray):
+            bids = bids.tolist()
+        if isinstance(asks, np.ndarray):
+            asks = asks.tolist()
 
-    return avg_gap / spread
+        best_bid = float(bids[0][0])
+        best_ask = float(asks[0][0])
+        return (best_bid + best_ask) / 2.0
+    except Exception as e:
+        print(f"[calc_mid_price] Warning: {e}")
+        return np.nan
+
+
+def calc_orderbook_imbalance(bids, asks, depth: int = 5):
+    """
+    L2 호가 불균형 = (Σ bid_qty - Σ ask_qty) / (Σ bid_qty + Σ ask_qty)
+    """
+    try:
+        if isinstance(bids, np.ndarray):
+            bids = bids.tolist()
+        if isinstance(asks, np.ndarray):
+            asks = asks.tolist()
+        if bids is None or len(bids) == 0 or asks is None or len(asks) == 0:
+            return np.nan
+
+        bids = np.array([[float(p), float(q)] for p, q in bids[:depth]], dtype=float)
+        asks = np.array([[float(p), float(q)] for p, q in asks[:depth]], dtype=float)
+
+        bid_vol = bids[:, 1].sum()
+        ask_vol = asks[:, 1].sum()
+        total = bid_vol + ask_vol
+        if total == 0:
+            return 0.0
+        return (bid_vol - ask_vol) / total
+    except Exception as e:
+        print(f"[calc_orderbook_imbalance] Warning: {e}")
+        return np.nan
+
+
+def calc_liquidity_gap(bids, asks, depth: int = 10):
+    """
+    호가 간격의 평균 — 유동성 공백
+    큰 값일수록 유동성 공백(=체결 슬리피지 위험) 높음
+    """
+    try:
+        if isinstance(bids, np.ndarray):
+            bids = bids.tolist()
+        if isinstance(asks, np.ndarray):
+            asks = asks.tolist()
+        if bids is None or len(bids) == 0 or asks is None or len(asks) == 0:
+            return np.nan
+
+        bid_prices = [float(p) for p, _ in bids[:depth]]
+        ask_prices = [float(p) for p, _ in asks[:depth]]
+        all_prices = sorted(bid_prices + ask_prices)
+        diffs = np.diff(all_prices)
+        if len(diffs) == 0:
+            return 0.0
+        return float(np.mean(np.abs(diffs)))
+    except Exception as e:
+        print(f"[calc_liquidity_gap] Warning: {e}")
+        return np.nan
+
+
+def calc_wall_strength(bids, asks, threshold_ratio: float = 3.0):
+    """
+    큰 매물벽(호가벽) 감지 비율
+    상위 depth 내 최대 잔량 / 평균 잔량
+    """
+    try:
+        if isinstance(bids, np.ndarray):
+            bids = bids.tolist()
+        if isinstance(asks, np.ndarray):
+            asks = asks.tolist()
+        if bids is None or len(bids) == 0 or asks is None or len(asks) == 0:
+            return np.nan
+
+        bid_qtys = np.array([float(q) for _, q in bids])
+        ask_qtys = np.array([float(q) for _, q in asks])
+        bid_ratio = np.max(bid_qtys) / (np.mean(bid_qtys) + 1e-6)
+        ask_ratio = np.max(ask_qtys) / (np.mean(ask_qtys) + 1e-6)
+        return (bid_ratio + ask_ratio) / 2.0
+    except Exception as e:
+        print(f"[calc_wall_strength] Warning: {e}")
+        return np.nan
+
+
+def calc_depth_balance(bids, asks, depth: int = 10):
+    """
+    상위 N호가 누적 체결 강도 비율
+    """
+    try:
+        if isinstance(bids, np.ndarray):
+            bids = bids.tolist()
+        if isinstance(asks, np.ndarray):
+            asks = asks.tolist()
+        if bids is None or len(bids) == 0 or asks is None or len(asks) == 0:
+            return np.nan
+
+        bids = np.array([[float(p), float(q)] for p, q in bids[:depth]], dtype=float)
+        asks = np.array([[float(p), float(q)] for p, q in asks[:depth]], dtype=float)
+
+        total_bid_val = np.sum(bids[:, 0] * bids[:, 1])
+        total_ask_val = np.sum(asks[:, 0] * asks[:, 1])
+        denom = total_bid_val + total_ask_val
+        if denom == 0:
+            return 0.0
+        return (total_bid_val - total_ask_val) / denom
+    except Exception as e:
+        print(f"[calc_depth_balance] Warning: {e}")
+        return np.nan
 
 
 # ==============================================================
-# 🧠 메인 피처 계산 함수
+# 🧩 통합 피처 추출 함수
 # ==============================================================
 
-def extract_orderbook_features(depth_snapshot: Dict) -> Dict:
+def extract_orderbook_features(snapshot: dict) -> dict:
     """
-    단일 depth 스냅샷(JSON) → 피처 딕셔너리 변환
-
-    | Feature               | 설명                            | 의미                |
-    | --------------------- | -----------------------------   | -----------------  |
-    | `spread`              | 최상단 매수·매도 간 가격차         | 슬리피지 위험 지표    |
-    | `mid_price`           | (bid+ask)/2                    | 기준 가격            |
-    | `orderbook_imbalance` | (Σbid - Σask) / (Σbid + Σask)  | 매수·매도 세력 비율   |
-    | `order_wall_ratio`    | 상위 2호가 집중도                | 대기 유동성 집중 여부  |
-    | `liquidity_void`      | 평균 호가 간격 / 스프레드         | 유동성 공백 정도      |
-
+    단일 시점 orderbook snapshot → 주요 피처 추출
+    snapshot = {
+        "timestamp": ...,
+        "bids": [[price, qty], ...],
+        "asks": [[price, qty], ...]
+    }
     """
-    bids = depth_snapshot.get("bids", [])
-    asks = depth_snapshot.get("asks", [])
-    
-    features = {
+    bids = snapshot.get("bids", [])
+    asks = snapshot.get("asks", [])
+    ts = snapshot.get("timestamp", None)
+
+    feats = {
+        "timestamp": pd.to_datetime(ts),
         "spread": calc_spread(bids, asks),
         "mid_price": calc_mid_price(bids, asks),
         "orderbook_imbalance": calc_orderbook_imbalance(bids, asks),
-        "order_wall_ratio": calc_order_wall_ratio(bids, asks),
-        "liquidity_void": calc_liquidity_void(bids, asks),
+        "liquidity_gap": calc_liquidity_gap(bids, asks),
+        "wall_strength": calc_wall_strength(bids, asks),
+        "depth_balance": calc_depth_balance(bids, asks),
     }
-    return features
+
+    # NaN 안정화
+    feats = {
+        k: (v if k == "timestamp" else (0.0 if pd.isna(v) else float(v)))
+        for k, v in feats.items()
+    }
+
+    return feats
 
 
 # ==============================================================
-# 🔬 테스트용 메인
+# 🔬 테스트
 # ==============================================================
 
 if __name__ == "__main__":
-    # 예시 입력 (depth.json 한 건)
-    sample_depth = {
-        "bids": [[54000.0, 2.1], [53999.5, 1.8], [53999.0, 1.2]],
-        "asks": [[54000.5, 2.4], [54001.0, 3.0], [54001.5, 1.7]]
+    from datetime import datetime
+
+    ob = {
+        "timestamp": datetime.utcnow(),
+        "bids": [[65000.0, 1.2], [64999.5, 0.8], [64999.0, 0.6], [64998.5, 0.4]],
+        "asks": [[65000.5, 1.5], [65001.0, 1.1], [65001.5, 0.9], [65002.0, 0.7]],
     }
 
-    feats = extract_orderbook_features(sample_depth)
-    print("🧩 Orderbook Features:")
+    feats = extract_orderbook_features(ob)
+    print("✅ Orderbook feature sample:")
     for k, v in feats.items():
-        print(f"  {k}: {v:.6f}")
+        print(f"  {k}: {v}")

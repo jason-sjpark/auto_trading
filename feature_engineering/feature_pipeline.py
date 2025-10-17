@@ -1,245 +1,163 @@
-from __future__ import annotations
 import pandas as pd
 import numpy as np
-from typing import Dict, List, Optional, Tuple, Union
-from datetime import timedelta
-
-# 우리 모듈들
-from feature_engineering.technical_indicators import extract_technical_indicators
+from typing import List, Optional
 from feature_engineering.orderbook_features import extract_orderbook_features
 from feature_engineering.trade_features import extract_trade_features
-from feature_engineering.feature_assembler import FeatureAssembler
+from feature_engineering.technical_indicators import compute_technical_indicators
 
 # ==============================================================
-# 기본 설정
-# ==============================================================
-
-# 멀티 타임프레임 지원 (원하는 것만 켜도 됨)
-DEFAULT_TFS = ["0.5s", "1s", "5s", "1min", "3min", "5min"]
-
-# trades 집계 시 사용할 기본 윈도우(초)
-TRADE_WINDOW_SECONDS = {
-    "0.5s": 0.5,
-    "1s": 1,
-    "5s": 5,
-    "1min": 60,
-    "3min": 180,
-    "5min": 300,
-}
-
-# depth 스냅샷과 trade/ohlcv를 맞출 때 허용 오차
-ALIGN_TOLERANCE = pd.Timedelta(milliseconds=300)
-
-
-# ==============================================================
-# 유틸
-# ==============================================================
-
-def _ensure_ts(df: pd.DataFrame, col: str = "timestamp") -> pd.DataFrame:
-    df = df.copy()
-    if not np.issubdtype(df[col].dtype, np.datetime64):
-        df[col] = pd.to_datetime(df[col])
-    return df.sort_values(col)
-
-
-def _resample_ohlcv(df_ohlcv: pd.DataFrame, tf: str) -> pd.DataFrame:
-    """
-    초단위 tf('0.5s','1s','5s') 또는 분 단위 tf('1min','3min','5min')로 리샘플링.
-    df_ohlcv 컬럼: timestamp, open, high, low, close, volume
-    """
-    df = _ensure_ts(df_ohlcv)
-    rule = tf.replace("min", "T")  # pandas 규칙(분) 표기: '1T','3T','5T'
-    o = (
-        df.set_index("timestamp")
-          .resample(rule)
-          .agg({"open": "first", "high": "max", "low": "min", "close": "last", "volume": "sum"})
-          .dropna()
-          .reset_index()
-    )
-    return o
-
-
-def _group_trades_by_window(df_trades: pd.DataFrame, window_sec: float) -> List[pd.DataFrame]:
-    """
-    trades를 고정 길이 창(window_sec)으로 연속 분할하여 리스트 반환.
-    실시간/스트리밍에서는 윈도우 슬라이딩 로직으로 교체 가능.
-    """
-    df = _ensure_ts(df_trades)
-    if df.empty:
-        return []
-
-    start = df["timestamp"].min()
-    end = df["timestamp"].max()
-    windows = []
-    cur_start = start
-
-    delta = pd.Timedelta(seconds=window_sec)
-
-    while cur_start <= end:
-        cur_end = cur_start + delta
-        seg = df[(df["timestamp"] >= cur_start) & (df["timestamp"] < cur_end)]
-        if len(seg) > 0:
-            windows.append(seg)
-        cur_start = cur_end
-    return windows
-
-
-def _nearest_join(left: pd.DataFrame, right: pd.DataFrame, on: str = "timestamp", tolerance=ALIGN_TOLERANCE, direction="nearest"):
-    """
-    pandas.merge_asof 래퍼: timestamp 기준 근접 매칭
-    """
-    left = _ensure_ts(left, on)
-    right = _ensure_ts(right, on)
-    return pd.merge_asof(
-        left.sort_values(on),
-        right.sort_values(on),
-        on=on,
-        direction=direction,
-        tolerance=tolerance
-    )
-
-
-# ==============================================================
-# 배치 파이프라인
+# 🧩 Batch Feature Pipeline
 # ==============================================================
 
 class BatchFeaturePipeline:
     """
-    배치(백테스트/학습 데이터 생성)용 통합 피처 파이프라인.
-    입력:
-      - ohlcv_df: 캔들(최소 1s 권장)
-      - trades_df: aggTrades (timestamp, price, qty, side)
-      - depth_df: depth 스냅샷 (timestamp, bids, asks)
-    출력:
-      - 멀티 타임프레임 결합 피처 DataFrame
+    OHLCV + Trades + Depth 데이터를 받아 통합 피처 세트를 생성하는 모듈.
     """
-    def __init__(self, timeframes: List[str] = None, normalize: bool = True, dropna: bool = True):
-        self.timeframes = timeframes or DEFAULT_TFS
-        self.assembler = FeatureAssembler(normalize=normalize, dropna=dropna)
 
+    def __init__(self, timeframes: Optional[List[str]] = None):
+        self.timeframes = timeframes or ["0.5s", "1s", "5s"]
+
+    # ----------------------------------------------------------
     def build_features(
         self,
         ohlcv_df: pd.DataFrame,
         trades_df: pd.DataFrame,
-        depth_df: pd.DataFrame,
+        depth_df: pd.DataFrame
     ) -> pd.DataFrame:
-        # 안전정렬
-        ohlcv_df = _ensure_ts(ohlcv_df)
-        trades_df = _ensure_ts(trades_df)
-        depth_df = _ensure_ts(depth_df)
+        """
+        3개 데이터셋을 받아 feature DataFrame 생성.
+        필수 컬럼:
+            ohlcv_df: [timestamp, open, high, low, close, volume]
+            trades_df: [timestamp, price, qty, side]
+            depth_df: [timestamp, bids, asks]
+        """
 
-        # --- 1) 기술적 지표 (기준 TF: 1s 또는 5s 이상 권장)
-        tech_df = extract_technical_indicators(ohlcv_df)  # timestamp, 지표컬럼들
+        # ---------- 0) 입력 유효성 검증 ----------
+        if ohlcv_df is None or trades_df is None or depth_df is None:
+            print("❌ [build_features] 입력 중 None 존재")
+            return pd.DataFrame(columns=["timestamp"])
 
-        # --- 2) TF별 trades 집계 → trade_features
-        tf_trade_feats = []
+        if len(ohlcv_df) == 0:
+            print("⚠️ [build_features] ohlcv_df 비어있음")
+            return pd.DataFrame(columns=["timestamp"])
+
+        # ---------- 1) timestamp 표준화 ----------
+        for df in [ohlcv_df, trades_df, depth_df]:
+            df["timestamp"] = pd.to_datetime(df["timestamp"], utc=True, errors="coerce")
+            df["timestamp"] = df["timestamp"].dt.tz_convert("UTC").dt.tz_localize(None)
+            df.sort_values("timestamp", inplace=True)
+            df.dropna(subset=["timestamp"], inplace=True)
+        ohlcv_df.drop_duplicates(subset=["timestamp"], inplace=True)
+
+        # ---------- 2) Trade Feature ----------
+        print("🟩 [build_features] 단계 2: Trade Feature 시작")
+        tf_dfs = []
         for tf in self.timeframes:
-            window_sec = TRADE_WINDOW_SECONDS["1s"]  # 기본 1초 집계 후 리샘플 추천
-            if tf in TRADE_WINDOW_SECONDS:
-                window_sec = TRADE_WINDOW_SECONDS[tf]
-
-            trade_windows = _group_trades_by_window(trades_df, window_sec)
-            rows = []
-            prev_avg_vol = 0.0
-
-            # rolling 평균 갱신용
-            vol_hist = []
-
-            for tw in trade_windows:
-                feats = extract_trade_features(tw, prev_avg_vol=prev_avg_vol)
-                # 윈도우의 중앙 timestamp 또는 마지막 timestamp 사용
-                ts = tw["timestamp"].max()
-                feats["timestamp"] = ts
-                feats["tf"] = tf
-                rows.append(feats)
-
-                # 평균 거래량 업데이트
-                vol_hist.append(tw["qty"].sum())
-                if len(vol_hist) > 30:
-                    vol_hist.pop(0)
-                prev_avg_vol = np.mean(vol_hist) if vol_hist else 0.0
-
-            df_tf = pd.DataFrame(rows)
-            if not df_tf.empty:
-                df_tf.rename(columns={c: f"{c}@{tf}" for c in df_tf.columns if c not in ["timestamp", "tf"]}, inplace=True)
-                tf_trade_feats.append(df_tf[["timestamp"] + [c for c in df_tf.columns if c not in ["tf"]]])
+            try:
+                window = pd.to_timedelta(tf)
+                grouped = trades_df.groupby(pd.Grouper(key="timestamp", freq=window))
+                rows = []
+                for ts, g in grouped:
+                    if len(g) == 0:
+                        continue
+                    feats = extract_trade_features(g)
+                    feats["timestamp"] = ts
+                    feats["tf"] = tf
+                    rows.append(feats)
+                tf_df = pd.DataFrame(rows)
+                print(f"  └─ {tf} 구간 결과:", tf_df.shape)
+                if len(tf_df) > 0:
+                    tf_df.rename(columns={c: f"{c}@{tf}" for c in tf_df.columns if c not in ["timestamp", "tf"]}, inplace=True)
+                    tf_dfs.append(tf_df)
+            except Exception as e:
+                print(f"[build_features] Trade TF={tf} 실패:", e)
 
         trade_feat_df = None
-        if tf_trade_feats:
-            # timestamp 기준 outer merge
-            trade_feat_df = tf_trade_feats[0]
-            for add in tf_trade_feats[1:]:
+        if tf_dfs:
+            trade_feat_df = tf_dfs[0]
+            for add in tf_dfs[1:]:
                 trade_feat_df = pd.merge(trade_feat_df, add, on="timestamp", how="outer")
-            trade_feat_df = trade_feat_df.sort_values("timestamp")
+            print("✅ Trade Feature 병합 완료:", trade_feat_df.shape)
+        else:
+            print("⚠️ Trade Feature 비어 있음")
 
-        # --- 3) TF별 depth → orderbook_features
-        ob_rows = []
-        for _, row in depth_df.iterrows():
-            ob = {"timestamp": row["timestamp"], "bids": row["bids"], "asks": row["asks"]}
-            feat = extract_orderbook_features(ob)
-            feat["timestamp"] = row["timestamp"]
-            ob_rows.append(feat)
-        ob_df = pd.DataFrame(ob_rows).sort_values("timestamp") if ob_rows else pd.DataFrame(columns=["timestamp"])
+        # ---------- 3) Orderbook Feature ----------
+        print("🟩 [build_features] 단계 3: Orderbook Feature 시작")
+        orderbook_rows = []
+        for _, ob in depth_df.iterrows():
+            feats = extract_orderbook_features(ob.to_dict())
+            orderbook_rows.append(feats)
+        ob_df = pd.DataFrame(orderbook_rows)
+        print("✅ Orderbook Feature 완료:", ob_df.shape)
 
-        # --- 4) 근접 조인으로 tech + trades + orderbook 결합
-        # 기준은 기술지표(=캔들) timestamp
-        feat_df = tech_df[["timestamp"]].copy()
+        # ---------- 4) Technical Indicator ----------
+        print("🟩 [build_features] 단계 4: Technical Indicator 시작")
+        tech_df = compute_technical_indicators(ohlcv_df.copy())
+        print("✅ Technical Feature 완료:", tech_df.shape)
 
-        if trade_feat_df is not None and not trade_feat_df.empty:
-            feat_df = _nearest_join(feat_df, trade_feat_df, "timestamp", tolerance=ALIGN_TOLERANCE)
 
-        if ob_df is not None and not ob_df.empty:
-            feat_df = _nearest_join(feat_df, ob_df, "timestamp", tolerance=ALIGN_TOLERANCE)
+        # ---------- 5) Merge all ----------
+        merged = ohlcv_df.copy()
+        for add_df in [trade_feat_df, ob_df, tech_df]:
+            if add_df is not None and len(add_df) > 0:
+                merged = pd.merge_asof(
+                    merged.sort_values("timestamp"),
+                    add_df.sort_values("timestamp"),
+                    on="timestamp",
+                    direction="nearest",
+                    tolerance=pd.Timedelta(seconds=3)
+                )
 
-        # tech 컬럼도 붙이기
-        feat_df = pd.merge_asof(
-            feat_df.sort_values("timestamp"),
-            tech_df.sort_values("timestamp"),
-            on="timestamp",
-            direction="nearest",
-            tolerance=ALIGN_TOLERANCE
-        )
+        # ---------- 6) 중복 / NaN 처리 ----------
+        merged = merged.loc[:, ~merged.columns.duplicated(keep="first")]
+        merged.fillna(method="ffill", inplace=True)
+        merged.fillna(method="bfill", inplace=True)
 
-        # 정리
-        feat_df = feat_df.sort_values("timestamp").dropna().reset_index(drop=True)
-        return feat_df
+        # ---------- 7) 최소 보장 ----------
+        if len(merged) == 0:
+            print("⚠️ [build_features] 최종 병합 결과가 비어 있음 — 최소 1행 생성")
+            merged = pd.DataFrame({
+                "timestamp": [pd.Timestamp.utcnow()],
+                "spread": [0.0],
+                "mid_price": [0.0],
+                "orderbook_imbalance": [0.0]
+            })
+
+        print(f"✅ [build_features] 결과 shape = {merged.shape}")
+        return merged
 
 
 # ==============================================================
-# 실시간 파이프라인
+# 🔬 테스트
 # ==============================================================
 
-class RealtimeFeaturePipeline:
-    """
-    실시간(스트리밍)용 피처 파이프라인.
-    - 최근 N초 OHLCV 슬라이스 + 현재 depth 스냅샷 + 최근 trades 윈도우
-    - FeatureAssembler를 이용해 한 시점 feature dict 생성
-    """
-    def __init__(self, normalize: bool = True, dropna: bool = True):
-        self.assembler = FeatureAssembler(normalize=normalize, dropna=dropna)
+if __name__ == "__main__":
+    # 간단한 더미 데이터로 테스트
+    import datetime
+    now = pd.Timestamp.utcnow().floor("s")
 
-    def transform(
-        self,
-        latest_orderbook_snapshot: Dict,     # {"timestamp":..., "bids":[[p,q],...], "asks":[[p,q],...]}
-        recent_trades_window: pd.DataFrame,  # 최근 1s/0.5s 등 윈도우
-        recent_ohlcv_slice: pd.DataFrame     # 최근 수 초/분의 OHLCV (지표계산용)
-    ) -> Dict:
-        # 1) technical indicators (최근 슬라이스에서 최신 행만 사용)
-        tech = extract_technical_indicators(recent_ohlcv_slice)
-        tech_last = tech.iloc[-1:].copy() if not tech.empty else pd.DataFrame()
+    ohlcv = pd.DataFrame({
+        "timestamp": pd.date_range(now, periods=5, freq="S"),
+        "open": np.random.rand(5),
+        "high": np.random.rand(5),
+        "low": np.random.rand(5),
+        "close": np.random.rand(5),
+        "volume": np.random.rand(5)
+    })
 
-        # 2) orderbook + trade 를 assembler로 통합
-        combined = self.assembler.assemble(
-            orderbook_snapshot=latest_orderbook_snapshot,
-            trades_df=recent_trades_window,
-            prev_avg_vol=recent_trades_window["qty"].rolling(30).sum().mean() if not recent_trades_window.empty else 0.0
-        )
+    trades = pd.DataFrame({
+        "timestamp": pd.date_range(now, periods=30, freq="200ms"),
+        "price": np.random.rand(30),
+        "qty": np.random.rand(30),
+        "side": np.random.choice(["buy", "sell"], size=30)
+    })
 
-        # 3) tech 컬럼 병합
-        if not tech_last.empty:
-            for col in tech_last.columns:
-                if col == "timestamp":
-                    continue
-                combined[col] = tech_last.iloc[0][col]
+    depth = pd.DataFrame({
+        "timestamp": pd.date_range(now, periods=5, freq="S"),
+        "bids": [[[100.0, 1.0], [99.5, 1.0]]] * 5,
+        "asks": [[[100.5, 1.0], [101.0, 1.0]]] * 5
+    })
 
-        return combined
+    pipe = BatchFeaturePipeline(timeframes=["0.5s", "1s"])
+    df = pipe.build_features(ohlcv_df=ohlcv, trades_df=trades, depth_df=depth)
+    print(df.head())

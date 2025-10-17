@@ -1,110 +1,96 @@
 import pandas as pd
 import numpy as np
-from typing import Dict
 
 # ==============================================================
-# ⚙️ Technical Indicators (OHLCV 기반)
+# 📊 Technical Indicators
 # ==============================================================
 
-def calc_rsi(df: pd.DataFrame, period: int = 14) -> pd.Series:
+def compute_technical_indicators(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    기본 OHLCV 데이터에서 대표적인 기술 지표들을 계산해 반환.
+    최소 컬럼: ['timestamp', 'open', 'high', 'low', 'close', 'volume']
+    """
+
+    df = df.copy().sort_values("timestamp").reset_index(drop=True)
+
+    # 안전장치: 필수 컬럼 검사
+    required = {"open", "high", "low", "close", "volume"}
+    if not required.issubset(df.columns):
+        print(f"⚠️ [compute_technical_indicators] 필수 컬럼 누락: {required - set(df.columns)}")
+        for c in required:
+            if c not in df:
+                df[c] = np.nan
+
+    # ---- EMA ----
+    df["ema_9"] = df["close"].ewm(span=9, adjust=False).mean()
+    df["ema_20"] = df["close"].ewm(span=20, adjust=False).mean()
+    df["ema_50"] = df["close"].ewm(span=50, adjust=False).mean()
+
+    # ---- RSI ----
     delta = df["close"].diff()
-    gain = np.where(delta > 0, delta, 0)
-    loss = np.where(delta < 0, -delta, 0)
-    avg_gain = pd.Series(gain).rolling(window=period, min_periods=1).mean()
-    avg_loss = pd.Series(loss).rolling(window=period, min_periods=1).mean()
+    gain = delta.clip(lower=0)
+    loss = -delta.clip(upper=0)
+    avg_gain = gain.ewm(com=13, adjust=False).mean()
+    avg_loss = loss.ewm(com=13, adjust=False).mean()
     rs = avg_gain / (avg_loss + 1e-10)
-    rsi = 100 - (100 / (1 + rs))
-    return pd.Series(rsi, index=df.index, name="rsi")
+    df["rsi_14"] = 100 - (100 / (1 + rs))
 
-
-def calc_ema(df: pd.DataFrame, period: int = 20) -> pd.Series:
-    return df["close"].ewm(span=period, adjust=False).mean()
-
-
-def calc_bollinger_bands(df: pd.DataFrame, period: int = 20, std_factor: float = 2.0):
-    ma = df["close"].rolling(window=period).mean()
-    std = df["close"].rolling(window=period).std()
-    upper = ma + std_factor * std
-    lower = ma - std_factor * std
-    width = (upper - lower) / ma
-    return ma, upper, lower, width
-
-
-def calc_vwap(df: pd.DataFrame) -> pd.Series:
-    cum_vol = df["volume"].cumsum()
-    cum_vol_price = (df["close"] * df["volume"]).cumsum()
-    return (cum_vol_price / cum_vol).rename("vwap")
-
-
-def calc_atr(df: pd.DataFrame, period: int = 14) -> pd.Series:
+    # ---- ATR ----
     high_low = df["high"] - df["low"]
-    high_close = np.abs(df["high"] - df["close"].shift())
-    low_close = np.abs(df["low"] - df["close"].shift())
+    high_close = (df["high"] - df["close"].shift()).abs()
+    low_close = (df["low"] - df["close"].shift()).abs()
     tr = pd.concat([high_low, high_close, low_close], axis=1).max(axis=1)
-    atr = tr.rolling(window=period).mean()
-    return atr.rename("atr")
+    df["atr_14"] = tr.rolling(window=14, min_periods=1).mean()
 
+    # ---- Bollinger Bands ----
+    df["bb_ma"] = df["close"].rolling(window=20, min_periods=1).mean()
+    df["bb_std"] = df["close"].rolling(window=20, min_periods=1).std()
+    df["bb_upper"] = df["bb_ma"] + (df["bb_std"] * 2)
+    df["bb_lower"] = df["bb_ma"] - (df["bb_std"] * 2)
+    df["bb_width"] = (df["bb_upper"] - df["bb_lower"]) / df["bb_ma"].replace(0, np.nan)
 
-# ==============================================================
-# 🧠 통합 Feature Extractor
-# ==============================================================
+    # ---- VWAP ----
+    df["vwap"] = (df["close"] * df["volume"]).cumsum() / (df["volume"].cumsum() + 1e-9)
 
-def extract_technical_indicators(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    입력: OHLCV DataFrame
-    출력: 기술적 지표가 추가된 DataFrame
+    # ---- Momentum & Volatility ----
+    df["momentum_5"] = df["close"].pct_change(periods=5)
+    df["volatility_5"] = df["close"].pct_change().rolling(window=5, min_periods=1).std()
 
-    | 지표              | 의미              |
-    | --------------- | --------------- |
-    | `ema_9, 20, 50` | 단기/중기/장기 지수이동평균 |
-    | `rsi_14`        | 과매수·과매도 구간 식별   |
-    | `bb_width`      | 볼린저 밴드 폭 (변동성)  |
-    | `atr_14`        | 절대적 변동성         |
-    | `vwap`          | 거래량 가중 평균가      |
-    | `momentum_5`    | 단기 추세 변화량       |
-    | `volatility_5`  | 5틱 변동성 표준편차     |
+    # ---- 정리 ----
+    df = df.dropna(subset=["timestamp"])
+    df = df.fillna(method="ffill").fillna(method="bfill")
 
-    """
-    df = df.copy()
-
-    df["ema_9"] = calc_ema(df, 9)
-    df["ema_20"] = calc_ema(df, 20)
-    df["ema_50"] = calc_ema(df, 50)
-    df["rsi_14"] = calc_rsi(df, 14)
-    df["vwap"] = calc_vwap(df)
-    df["atr_14"] = calc_atr(df, 14)
-
-    ma, upper, lower, width = calc_bollinger_bands(df, 20)
-    df["bb_ma"] = ma
-    df["bb_upper"] = upper
-    df["bb_lower"] = lower
-    df["bb_width"] = width
-
-    # 모멘텀 / 변동성 보조 피처
-    df["momentum_5"] = df["close"].diff(5)
-    df["volatility_5"] = df["close"].pct_change().rolling(5).std()
-
-    # 결측치 제거
-    df = df.dropna().reset_index(drop=True)
+    # 필요한 컬럼만 반환
+    cols = [
+        "timestamp",
+        "ema_9", "ema_20", "ema_50",
+        "rsi_14",
+        "vwap",
+        "atr_14",
+        "bb_ma", "bb_upper", "bb_lower", "bb_width",
+        "momentum_5", "volatility_5"
+    ]
+    df = df[cols]
+    print(f"✅ [compute_technical_indicators] 완료: shape={df.shape}")
     return df
 
 
 # ==============================================================
-# 🔬 테스트용 메인
+# 🔬 테스트
 # ==============================================================
 
 if __name__ == "__main__":
-    # 테스트용 데이터
-    np.random.seed(42)
+    import datetime
+    now = pd.Timestamp.utcnow().floor("s")
+
     data = {
-        "timestamp": pd.date_range("2025-10-17 09:00:00", periods=100, freq="S"),
-        "open": np.random.normal(54000, 5, 100),
-        "high": np.random.normal(54010, 5, 100),
-        "low": np.random.normal(53990, 5, 100),
-        "close": np.random.normal(54000, 5, 100),
-        "volume": np.random.uniform(1, 5, 100),
+        "timestamp": pd.date_range(now, periods=30, freq="S"),
+        "open": np.random.rand(30) * 100,
+        "high": np.random.rand(30) * 100,
+        "low": np.random.rand(30) * 100,
+        "close": np.random.rand(30) * 100,
+        "volume": np.random.rand(30) * 50
     }
     df = pd.DataFrame(data)
-    tech = extract_technical_indicators(df)
-    print("🧩 Technical Indicators Sample:")
-    print(tech.tail(3).T)
+    tech = compute_technical_indicators(df)
+    print(tech.head())
