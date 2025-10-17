@@ -1,0 +1,65 @@
+# ========================
+# General ignores
+# ========================
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.log
+*.tmp
+*.bak
+*.swp
+.DS_Store
+
+# ========================
+# Python virtual environment
+# ========================
+venv/
+.env/
+.venv/
+env/
+*.egg-info/
+dist/
+build/
+
+# ========================
+# Jupyter notebooks
+# ========================
+.ipynb_checkpoints/
+
+# ========================
+# OS / Editor files
+# ========================
+Thumbs.db
+.vscode/
+.idea/
+
+# ========================
+# Config & Security
+# ========================
+config/secret.key
+config/secrets.yaml
+config/*.pem
+config/*.crt
+config/*.key
+config/*.env
+
+# Keep encrypted secret file (safe)
+!config/secrets.yaml.enc
+
+# ========================
+# Data & Logs
+# ========================
+data/
+storage/
+logs/
+notebooks/output/
+backtest/results/
+cache/
+
+# ========================
+# Model artifacts
+# ========================
+models/checkpoints/
+models/outputs/
+models/tmp/

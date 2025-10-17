@@ -1,0 +1,35 @@
+environment: "dev"
+
+exchange:
+  default: "binance"
+  binance:
+    rest_url: "https://fapi.binance.com"
+    ws_url: "wss://fstream.binance.com/ws"
+    symbol: "BTCUSDT"
+    leverage: 10
+    testnet: true
+
+data:
+  storage_path: "./data"
+  timeseries_db: "sqlite"   # dev: sqlite, prod: clickhouse
+  archive_path: "./storage/archive"
+
+messaging:
+  backend: "redis"
+  redis_url: "redis://localhost:6379/0"
+
+risk:
+  max_spread_pct: 0.15
+  min_liquidity: 0.5
+  slippage_limit: 0.03
+
+logging:
+  level: "INFO"
+  log_path: "./logs"
+
+model:
+  active_model_version: "scalping_v1"
+  inference_endpoint: "http://localhost:8000/predict"
+  
+telegram:
+  use_alerts: true
