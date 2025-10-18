@@ -11,7 +11,7 @@ exchange:
 
 data:
   storage_path: "./data"
-  timeseries_db: "sqlite"   # dev: sqlite, prod: clickhouse
+  timeseries_db: "sqlite" # dev: sqlite, prod: clickhouse
   archive_path: "./storage/archive"
 
 messaging:
@@ -30,6 +30,22 @@ logging:
 model:
   active_model_version: "scalping_v1"
   inference_endpoint: "http://localhost:8000/predict"
-  
+
 telegram:
   use_alerts: true
+
+labeling:
+  horizon_s: 5
+  threshold_bp: 10 # 10 bp = 0.10%
+  neutral_band: true
+
+features:
+  trade_windows_s: [0.5, 1, 5] # 문서용. 실제는 trade_features 내부에서 처리
+  liquidations:
+    windows_s: [30, 60]
+    big_notional: 100000 # 100k USDT 기준 대형 청산
+  orderbook:
+    agg_K: 5 # 집계형에서 ±1~±K% 밴드 사용
+
+paths:
+  features_out: data/features/features_1s.parquet

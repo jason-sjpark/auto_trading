@@ -1,281 +1,373 @@
-###필독!!!
-###실제로 돌릴때는 safemode를 false로 바꿔야함.
-###연산이 오래걸려서 임시로 해놓은거임
-
 # scripts/make_training_data.py
-import os, glob, re, gc, sys, time
-import pandas as pd
-import numpy as np
+"""
+통합 학습 데이터 생성 파이프라인 (전역 safemode 스위치)
+
+- 입력:
+  * OHLCV(1s): data/processed/ohlcv_1s_YYYYMMDD.parquet
+  * Trades raw: data/raw/aggTrades/{SYMBOL}/YYYY-MM-DD.parquet
+  * Depth raw : data/raw/depth/{SYMBOL}/YYYY-MM-DD.parquet  (집계형 bookDepth 피벗 완료본)
+  * External  : data/external/*.parquet (funding, oi, lsr, index/mark, arb)
+  * Liquidations(옵션): data/realtime/liquidations/{SYMBOL}/**/*.parquet
+
+- 출력:
+  * data/features/features_1s.parquet
+
+- 라벨:
+  * horizon_s=5, threshold_bp=10 (±0.10%), neutral 포함
+
+- safemode (전역 변수):
+  * True  → 15분 클립으로 빠른 검증
+  * False → 전체 구간
+"""
+
+import os
+import sys
+import glob
+import time
+import argparse
 from datetime import timedelta
 
+import pandas as pd
+import numpy as np
+
+# ===== 전역 스위치 =====
+safemode: bool = True   # ← 여기만 True/False 로 바꿔서 사용
+
+# --- 로컬 모듈 ---
 from feature_engineering.feature_pipeline import BatchFeaturePipeline
 from feature_engineering.external_features import build_external_features
 from labeling.scalping_labeler import make_scalping_labels
 
-# ================== 설정 ==================
-OUT_PATH = "data/features/features_1s.parquet"
 
-# 라벨
-LABEL_HORIZON = 5
-LABEL_THRESHOLD_PCT = 0.05  # (회의 사항: 스캘핑이면 bps 기준 권장)
+# -------------------------
+# 유틸
+# -------------------------
+def _to_dt_utc_naive(s) -> pd.Series:
+    ts = pd.to_datetime(s, utc=True, errors="coerce")
+    return ts.dt.tz_convert("UTC").dt.tz_localize(None)
 
-# asof 병합 허용 오차 사다리
-ASOF_TOLERANCES = [
-    pd.Timedelta(milliseconds=500),
-    pd.Timedelta(seconds=2),
-    pd.Timedelta(seconds=5),
-    pd.Timedelta(seconds=10),
-]
-
-# 🔸 세이프 모드: 처음엔 15분만 돌려서 빠르게 완주 → 이후 창을 늘려가며 확인
-SAFE_MODE = True
-SAFE_WINDOW_MIN = 15  # 15분
-
-# 외부지표 윈도우 패딩(라벨/피처 창 주위로 여유)
-EXTERNAL_PAD_HOURS = 12
-
-# ================== 유틸 ==================
-def _tz_normalize(df: pd.DataFrame, col="timestamp"):
-    if df is None or df.empty:
-        return pd.DataFrame(columns=[col])
-    s = pd.to_datetime(df[col], utc=True, errors="coerce")
-    s = s.dt.tz_convert("UTC").dt.tz_localize(None)
-    out = df.copy()
-    out[col] = s
-    out = out.dropna(subset=[col]).drop_duplicates(subset=[col]).sort_values(col)
-    out.reset_index(drop=True, inplace=True)
-    return out
-
-def _print_range(name, df, col="timestamp"):
+def _print_range(name: str, df: pd.DataFrame, col: str = "timestamp"):
     if df is None or df.empty or col not in df.columns:
-        print(f"⚠️ {name} EMPTY"); return
+        print(f"⚠️ {name} EMPTY")
+        return
     print(f"⏱ {name} range: {df[col].min()} → {df[col].max()} ({len(df)} rows)")
 
-def _glob_all(patterns):
-    if isinstance(patterns, str): patterns = [patterns]
-    files = []
-    for pat in patterns:
-        files += glob.glob(pat, recursive=True)
-    return sorted(files)
+def _latest_path(pattern: str) -> str:
+    paths = glob.glob(pattern)
+    if not paths:
+        return ""
+    paths.sort(key=lambda p: os.path.getmtime(p))
+    return paths[-1]
 
-def _extract_day_from_path(path: str):
-    m = re.search(r"(\d{4})[-_]?(\d{2})[-_]?(\d{2})", os.path.basename(path))
-    if not m: return None
-    y, mth, d = m.groups()
-    return f"{y}-{mth}-{d}"
+def _detect_ohlcv(date: str = "", base="data/processed") -> str:
+    if date:
+        return os.path.join(base, f"ohlcv_1s_{date.replace('-', '')}.parquet")
+    return _latest_path(os.path.join(base, "ohlcv_1s_*.parquet"))
 
-def _latest_nonempty(patterns, min_rows: int = 1):
-    files = _glob_all(patterns)
-    for p in reversed(files):
-        try:
-            df = pd.read_parquet(p, columns=["timestamp"])
-            if len(df) >= min_rows:
-                return p
-        except Exception:
-            continue
-    return files[-1] if files else None
+def _detect_trades(symbol: str, date: str, base="data/raw/aggTrades") -> str:
+    return os.path.join(base, symbol, f"{date}.parquet")
 
-def _pick_same_day_or_nearest(patterns, target_day: str, min_rows: int = 1):
-    files = _glob_all(patterns)
-    if not files: return None, "no_files"
+def _detect_depth(symbol: str, date: str, base="data/raw/depth") -> str:
+    return os.path.join(base, symbol, f"{date}.parquet")
 
-    same = [p for p in files if _extract_day_from_path(p) == target_day]
-    for p in reversed(same):
-        try:
-            if len(pd.read_parquet(p, columns=["timestamp"])) >= min_rows:
-                return p, "same_day"
-        except: pass
-
-    dated = []
-    for p in files:
-        day = _extract_day_from_path(p)
-        if day:
-            dated.append((p, day))
-    dated = sorted(dated, key=lambda x: x[1])
-    if not dated: return None, "no_dated"
-
-    target = pd.to_datetime(target_day)
-    best_p, best_abs = None, None
-    for p, day in dated:
-        try:
-            d = pd.to_datetime(day)
-            diff = abs((d - target).days)
-            rows = len(pd.read_parquet(p, columns=["timestamp"]))
-            if rows < min_rows: continue
-            if best_abs is None or diff < best_abs:
-                best_p, best_abs = p, diff
-        except:
-            continue
-    if best_p:
-        return best_p, "nearest_day"
-    return None, "no_match"
-
-def _clip_by_window(df, start, end, col="timestamp"):
-    if df is None or df.empty or col not in df.columns:
+def _load_parquet_safe(path: str, required_cols=None) -> pd.DataFrame:
+    try:
+        if not path or not os.path.exists(path):
+            return pd.DataFrame()
+        df = pd.read_parquet(path)
+        if required_cols:
+            for c in required_cols:
+                if c not in df.columns:
+                    df[c] = np.nan
         return df
-    m = (df[col] >= start) & (df[col] <= end)
-    return df.loc[m].reset_index(drop=True)
+    except Exception as e:
+        print(f"⚠️ read parquet failed: {path} → {e}")
+        return pd.DataFrame()
 
-def _try_asof_merge(left, right, tolerances):
-    if left is None or left.empty: return left
-    if right is None or right.empty: return left
-    merged = left
-    for tol in tolerances:
-        merged = pd.merge_asof(
-            left.sort_values("timestamp"),
-            right.sort_values("timestamp"),
-            on="timestamp", direction="nearest", tolerance=tol,
-        )
-        print(f"🧪 merge_asof with tolerance={tol}: result rows = {len(merged)}")
-        if len(merged) > 0:
-            print(f"✅ merged with tolerance={tol}")
-            return merged
-    print("⚠️ asof merge did not produce rows with given tolerances; returning last attempt")
-    return merged
+def _load_external_inputs() -> dict:
+    base = "data/external"
+    out = {}
+    out["funding"]          = _load_parquet_safe(_latest_path(os.path.join(base, "funding_rates_*.parquet")))
+    out["open_interest"]    = _load_parquet_safe(_latest_path(os.path.join(base, "open_interest_*.parquet")))
+    out["long_short_ratio"] = _load_parquet_safe(_latest_path(os.path.join(base, "long_short_ratio_*.parquet")))
+    out["index_mark"]       = _load_parquet_safe(_latest_path(os.path.join(base, "index_mark_*.parquet")))
+    out["arbitrage"]        = _load_parquet_safe(_latest_path(os.path.join(base, "arbitrage_spreads_*.parquet")))
+    return out
 
-def _log_step(name, t0):
-    t1 = time.perf_counter()
-    print(f"⏳ {name} done in {t1 - t0:.2f}s")
-    return t1
+def _load_liquidations_between(symbol="BTCUSDT", start=None, end=None) -> pd.DataFrame:
+    """실시간 청산 스냅샷(WS 저장분) 로딩"""
+    root = os.path.join("data", "realtime", "liquidations", symbol)
+    frames = []
+    for path in glob.glob(os.path.join(root, "**", "*.parquet"), recursive=True):
+        try:
+            df = pd.read_parquet(path)
+            if "timestamp" not in df.columns:
+                continue
+            df["timestamp"] = _to_dt_utc_naive(df["timestamp"])
+            if start is not None:
+                df = df[df["timestamp"] >= start]
+            if end is not None:
+                df = df[df["timestamp"] <= end]
+            if not df.empty:
+                cols = [c for c in ["timestamp", "side", "price", "qty", "notional"] if c in df.columns]
+                frames.append(df[cols])
+        except Exception:
+            pass
+    if not frames:
+        return pd.DataFrame(columns=["timestamp", "side", "price", "qty", "notional"])
+    out = pd.concat(frames, ignore_index=True).sort_values("timestamp")
+    return out
 
-# ================== 메인 ==================
-if __name__ == "__main__":
-    T0 = time.perf_counter()
+def _detect_rt_best(symbol: str, date: str, base="data/processed/realtime_depth_best") -> str:
+    # date: "YYYY-MM-DD"
+    return os.path.join(base, symbol, f"{date}.parquet")
+
+def _load_rt_best(symbol: str, date: str):
+    p = _detect_rt_best(symbol, date)
+    if not os.path.exists(p):
+        return pd.DataFrame()
+    df = pd.read_parquet(p)
+    if "timestamp" not in df.columns:
+        return pd.DataFrame()
+    df["timestamp"] = _to_dt_utc_naive(df["timestamp"])
+    keep = [c for c in [
+        "timestamp","best_bid","best_ask","best_bid_sz","best_ask_sz","spread","mid_price","ob_imbalance"
+    ] if c in df.columns]
+    return df[keep].dropna(subset=["timestamp"]).sort_values("timestamp")
+
+
+# -------------------------
+# 메인
+# -------------------------
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--symbol", default="BTCUSDT")
+    ap.add_argument("--date", default="", help="YYYY-MM-DD (미지정 시 최신 OHLCV 날짜로 추정)")
+    ap.add_argument("--out", default="data/features/features_1s.parquet")
+    ap.add_argument("--horizon_s", type=int, default=5)
+    ap.add_argument("--threshold_bp", type=float, default=10.0)
+    args = ap.parse_args()
+
+    symbol = args.symbol
+    horizon_s = int(args.horizon_s)
+    threshold_bp = float(args.threshold_bp)
+
+    # --- 1) 입력 경로 탐색/로드 ---
+    t0 = time.time()
+    ohlcv_path = _detect_ohlcv(args.date)
+    if not ohlcv_path:
+        print("❌ OHLCV 파일을 찾지 못했습니다. 먼저 backfill 또는 실시간 수집으로 1s OHLCV를 생성하세요.")
+        sys.exit(1)
+
+    # date 추출
+    if args.date:
+        date_str = args.date
+    else:
+        base = os.path.basename(ohlcv_path)  # ohlcv_1s_YYYYMMDD.parquet
+        date_str = base.replace("ohlcv_1s_", "").replace(".parquet", "")
+        if len(date_str) == 8:
+            date_str = f"{date_str[0:4]}-{date_str[4:6]}-{date_str[6:8]}"
+
+    trades_path = _detect_trades(symbol, date_str)
+    depth_path  = _detect_depth(symbol, date_str)
+
     print("📥 Loading source data...")
-
-    # 1) 기준 OHLCV
-    t = time.perf_counter()
-    OHLCV_PATH = _latest_nonempty("data/processed/ohlcv_1s_*.parquet", min_rows=10)
-    if not OHLCV_PATH:
-        raise SystemExit("❌ no OHLCV found. Run backfill/make-ohlcv first.")
-    ohlcv_day = _extract_day_from_path(OHLCV_PATH)
-    ohlcv = _tz_normalize(pd.read_parquet(OHLCV_PATH))
+    ohlcv = _load_parquet_safe(ohlcv_path, required_cols=["timestamp", "open", "high", "low", "close", "volume"])
+    ohlcv["timestamp"] = _to_dt_utc_naive(ohlcv["timestamp"])
+    ohlcv = ohlcv.dropna(subset=["timestamp"]).sort_values("timestamp")
     _print_range("OHLCV", ohlcv)
-    t = _log_step("load OHLCV", t)
+    print(f"⏳ load OHLCV done in {time.time()-t0:.2f}s")
 
-    # 2) 같은 날 TRADES/DEPTH
-    TRADES_PATH, t_sel = _pick_same_day_or_nearest(
-        ["data/raw/aggTrades/**/*.parquet", "data/realtime/aggTrades/**/*.parquet"],
-        ohlcv_day, min_rows=10
-    )
-    DEPTH_PATH, d_sel  = _pick_same_day_or_nearest(
-        ["data/raw/depth/**/*.parquet",      "data/realtime/depth/**/*.parquet"],
-        ohlcv_day, min_rows=10
-    )
-    trades = _tz_normalize(pd.read_parquet(TRADES_PATH)) if TRADES_PATH else pd.DataFrame(columns=["timestamp","price","qty","side","trade_id","is_buyer_maker"])
-    depth  = _tz_normalize(pd.read_parquet(DEPTH_PATH )) if DEPTH_PATH  else pd.DataFrame(columns=["timestamp","bids","asks"])
+    t1 = time.time()
+    trades = _load_parquet_safe(trades_path)
+    if not trades.empty:
+        # 표준화: timestamp/price/qty/side
+        ts_col = "timestamp" if "timestamp" in trades.columns else ("time" if "time" in trades.columns else None)
+        if ts_col:
+            trades["timestamp"] = trades[ts_col]
+        trades["timestamp"] = _to_dt_utc_naive(trades["timestamp"])
+        trades["price"] = pd.to_numeric(trades.get("price", 0), errors="coerce")
+        trades["qty"] = pd.to_numeric(trades.get("qty", 0), errors="coerce")
+        if "side" not in trades.columns and "is_buyer_maker" in trades.columns:
+            trades["side"] = np.where(trades["is_buyer_maker"], "sell", "buy")
+        trades["side"] = trades.get("side", "buy").astype(str).str.lower()
+        trades = trades.dropna(subset=["timestamp"]).sort_values("timestamp")
     _print_range("TRADES", trades)
-    _print_range("DEPTH", depth)
-    t = _log_step("load TRADES/DEPTH", t)
 
-    # 3) 공통 시간창(교집합) + SAFE_WINDOW 적용
-    t_min = max([x["timestamp"].min() for x in [ohlcv, trades, depth] if not x.empty])
-    t_max = min([x["timestamp"].max() for x in [ohlcv, trades, depth] if not x.empty])
-    if pd.isna(t_min) or pd.isna(t_max) or t_min >= t_max:
-        t_min = ohlcv["timestamp"].min()
-        t_max = ohlcv["timestamp"].max()
-        print(f"⚠️ no overlap; use OHLCV window: {t_min} → {t_max}")
+    # --- DEPTH: ① 집계 depth 로드 → ② 실시간 BEST 있으면 교체 → ③ 둘 다 없으면 placeholder ---
+    depth = _load_parquet_safe(depth_path)
+    if not depth.empty:
+        if "timestamp" in depth.columns:
+            depth["timestamp"] = _to_dt_utc_naive(depth["timestamp"])
+            depth = depth.dropna(subset=["timestamp"]).sort_values("timestamp")
 
-    if SAFE_MODE:
-        t_max_safe = t_min + pd.Timedelta(minutes=SAFE_WINDOW_MIN)
-        if t_max_safe < t_max:
-            print(f"🔒 SAFE MODE: restricting window to {SAFE_WINDOW_MIN} minutes → {t_min} → {t_max_safe}")
-            t_max = t_max_safe
+    rt_best = _load_rt_best(symbol, date_str)
+    if not rt_best.empty:
+        depth = rt_best  # 진짜 spread/mid 확보용
+        print("🔁 Using realtime BEST depth instead of aggregated bookDepth")
 
-    pad = timedelta(hours=EXTERNAL_PAD_HOURS)
-    ext_min, ext_max = t_min - pad, t_max + pad
+    if depth is None or depth.empty or "timestamp" not in depth.columns:
+        # placeholder: OHLCV 타임스탬프에 정렬 (피처 파이프라인이 기대하는 컬럼 뼈대 제공)
+        placeholder = pd.DataFrame({"timestamp": ohlcv["timestamp"].copy()})
+        for c in ["best_bid","best_ask","best_bid_sz","best_ask_sz","spread","mid_price","ob_imbalance"]:
+            placeholder[c] = np.nan
+        depth = placeholder
+        print("⚠️ No depth sources found. Created placeholder depth aligned to OHLCV.")
 
-    ohlcv  = _clip_by_window(ohlcv,  t_min, t_max)
-    trades = _clip_by_window(trades, t_min, t_max)
-    depth  = _clip_by_window(depth,  t_min, t_max)
-    _print_range("OHLCV(clipped)", ohlcv)
-    _print_range("TRADES(clipped)", trades)
-    _print_range("DEPTH(clipped)",  depth)
-    t = _log_step("clip windows", t)
+    _print_range("DEPTH(final)", depth)
+    print(f"⏳ load TRADES/DEPTH done in {time.time()-t1:.2f}s")
 
-    # 4) 외부지표: 최신 파일 읽고 강제 슬라이스
-    def _latest(pat):
-        fs = _glob_all(pat); return fs[-1] if fs else None
-    ext_inputs = {
-        "funding":         pd.read_parquet(_latest("data/external/funding_rates_*.parquet")) if _latest("data/external/funding_rates_*.parquet") else pd.DataFrame(),
-        "open_interest":   pd.read_parquet(_latest("data/external/open_interest_*.parquet")) if _latest("data/external/open_interest_*.parquet") else pd.DataFrame(),
-        "long_short_ratio":pd.read_parquet(_latest("data/external/long_short_ratio_*.parquet")) if _latest("data/external/long_short_ratio_*.parquet") else pd.DataFrame(),
-        "index_mark":      pd.read_parquet(_latest("data/external/index_mark_*.parquet")) if _latest("data/external/index_mark_*.parquet") else pd.DataFrame(),
-        "liquidations":    pd.read_parquet(_latest("data/external/liquidations_*.parquet")) if _latest("data/external/liquidations_*.parquet") else pd.DataFrame(),
-        "arbitrage":       pd.read_parquet(_latest("data/external/arbitrage_spreads_*.parquet")) if _latest("data/external/arbitrage_spreads_*.parquet") else pd.DataFrame(),
-    }
-    for k, v in list(ext_inputs.items()):
-        if v is None or v.empty:
-            ext_inputs[k] = pd.DataFrame(columns=["timestamp"])
+    # --- 1.5) safemode: 15분 클립 ---
+    # 공통 구간 탐색 시, 각 DF가 비어있을 수 있으므로 안전하게 계산
+    cstart_candidates = []
+    cend_candidates = []
+
+    if not ohlcv.empty:
+        cstart_candidates.append(ohlcv["timestamp"].min())
+        cend_candidates.append(ohlcv["timestamp"].max())
+    if not trades.empty:
+        cstart_candidates.append(trades["timestamp"].min())
+        cend_candidates.append(trades["timestamp"].max())
+    if not depth.empty:
+        cstart_candidates.append(depth["timestamp"].min())
+        cend_candidates.append(depth["timestamp"].max())
+
+    if cstart_candidates and cend_candidates:
+        clip_start = max(cstart_candidates)
+        clip_end   = min(cend_candidates)
+    else:
+        print("❌ 입력 데이터가 모두 비어 있습니다.")
+        sys.exit(1)
+
+    if pd.isna(clip_start) or pd.isna(clip_end) or clip_end <= clip_start:
+        if not ohlcv.empty:
+            clip_start = ohlcv["timestamp"].min()
+            clip_end   = clip_start + timedelta(minutes=15)
         else:
-            v = _tz_normalize(v)
-            v = _clip_by_window(v, ext_min, ext_max)
-            ext_inputs[k] = v
-    t = _log_step("load external inputs", t)
+            print("❌ 겹치는 시간 구간을 찾지 못했습니다.")
+            sys.exit(1)
 
-    external_df = build_external_features(ext_inputs)
-    if external_df is None or external_df.empty:
+    if safemode:
+        _clip_end = min(clip_end, clip_start + timedelta(minutes=15))
+        print(f"🔒 SAFE MODE: restricting window to 15 minutes → {clip_start} → {_clip_end}")
+        ohlcv  = ohlcv[(ohlcv["timestamp"] >= clip_start) & (ohlcv["timestamp"] <= _clip_end)]
+        trades = trades[(trades["timestamp"] >= clip_start) & (trades["timestamp"] <= _clip_end)]
+        depth  = depth[(depth["timestamp"]  >= clip_start) & (depth["timestamp"]  <= _clip_end)]
+        _print_range("OHLCV(clipped)", ohlcv)
+        _print_range("TRADES(clipped)", trades)
+        _print_range("DEPTH(clipped)", depth)
+        print("⏳ clip windows done in {:.2f}s".format(time.time()-t1))
+
+    # --- 2) 외부지표 + 리퀴데이션 통합 ---
+    t2 = time.time()
+    ext_inputs = _load_external_inputs()
+    liq_df = _load_liquidations_between(symbol=symbol, start=ohlcv["timestamp"].min(), end=ohlcv["timestamp"].max())
+    if not liq_df.empty:
+        ext_inputs["liquidations"] = liq_df
+
+    print("⏳ load external inputs done in {:.2f}s".format(time.time()-t2))
+    ext_all = []
+    for k, v in ext_inputs.items():
+        if v is not None and not v.empty and "timestamp" in v.columns:
+            ext_all.append(v[["timestamp"]])
+    if ext_all:
+        tmp = pd.concat(ext_all, ignore_index=True)
+        tmp["timestamp"] = _to_dt_utc_naive(tmp["timestamp"])
+        if not tmp.empty:
+            print("⏱ EXTERNAL range: {} → {} ({} rows)".format(tmp["timestamp"].min(), tmp["timestamp"].max(), len(tmp)))
+    external_df = build_external_features(
+        ext_inputs,
+        liq_windows_s=(30, 60),
+        big_liq_notional=100000.0
+    )
+    if external_df is None:
         external_df = pd.DataFrame(columns=["timestamp"])
+    print("⏳ build external_df done in {:.2f}s".format(time.time()-t2))
+
+    # --- 3) 피처 생성 ---
+    t3 = time.time()
+    pipe = BatchFeaturePipeline(timeframes=["0.5s", "1s", "5s"])
+    try:
+        features_df = pipe.build_features(
+            ohlcv_df=ohlcv,
+            trades_df=trades,
+            depth_df=depth,
+            external_df=external_df
+        )
+    except Exception as e:
+        print(f"❌ pipe.build_features failed: {e}")
+        raise
+
+    if features_df is None or features_df.empty:
+        print("⚠️ [build_features] 결과 DataFrame이 비어 있습니다.")
+        print("ohlcv_df:", ohlcv.shape if ohlcv is not None else None)
+        print("trades_df:", trades.shape if trades is not None else None)
+        print("depth_df:", depth.shape if depth is not None else None)
     else:
-        external_df = _tz_normalize(external_df)
-        external_df = _clip_by_window(external_df, ext_min, ext_max)
-    _print_range("EXTERNAL", external_df)
-    t = _log_step("build external_df", t)
+        features_df = features_df.loc[:, ~features_df.columns.duplicated(keep="first")]
+        if "timestamp" in features_df.columns:
+            features_df["timestamp"] = _to_dt_utc_naive(features_df["timestamp"])
+            features_df = features_df.dropna(subset=["timestamp"]).sort_values("timestamp")
+        features_df = features_df.ffill().bfill()
 
-    # 5) 피처 생성 (여기가 무거우면 시간이 걸림 → 타이머 출력)
-    pipe = BatchFeaturePipeline(timeframes=["0.5s","1s","5s"])
-    t_build = time.perf_counter()
-    features_df = pipe.build_features(ohlcv, trades, depth, external_df=external_df)
-    t = _log_step("pipe.build_features", t_build)
-
-    features_df = features_df.loc[:, ~features_df.columns.duplicated(keep="first")]
-    features_df = _tz_normalize(features_df)
+    print("✅ [build_features] shape={}".format(features_df.shape if features_df is not None else None))
+    print("⏳ pipe.build_features done in {:.2f}s".format(time.time()-t3))
     _print_range("FEATURES", features_df)
-    if features_df.empty: print("⚠️ FEATURES EMPTY")
-    t = _log_step("post features", t)
+    print("⏳ post features done in {:.2f}s".format(time.time()-t3))
 
-    # 6) 라벨 생성
-    t_lab = time.perf_counter()
-    labeled = make_scalping_labels(ohlcv, horizon=LABEL_HORIZON, threshold_pct=LABEL_THRESHOLD_PCT)
-    labeled = labeled[["timestamp","label","future_return"]]
-    labeled = labeled.loc[:, ~labeled.columns.duplicated(keep="first")]
-    labeled = _tz_normalize(labeled)
-    labeled = _clip_by_window(labeled, ohlcv["timestamp"].min(), ohlcv["timestamp"].max())
+    # --- 4) 라벨 생성 ---
+    t4 = time.time()
+    labeled = make_scalping_labels(
+        ohlcv_df=ohlcv,
+        horizon_s=horizon_s,
+        threshold_bp=threshold_bp,
+        neutral_band=True,
+        price_col="close",
+    )
+    labeled = labeled[["timestamp", "label", "future_return"]]
+    labeled["timestamp"] = _to_dt_utc_naive(labeled["timestamp"])
+    labeled = labeled.dropna(subset=["timestamp"]).sort_values("timestamp")
     _print_range("LABELS", labeled)
-    t = _log_step("make labels", t_lab)
+    print("⏳ make labels done in {:.2f}s".format(time.time()-t4))
 
-    # 7) 병합
-    t_merge = time.perf_counter()
-    final_dataset = features_df.copy()
-    if not features_df.empty and not labeled.empty:
-        final_dataset = _try_asof_merge(features_df, labeled, ASOF_TOLERANCES)
-        if final_dataset[["label","future_return"]].isna().all().all():
-            print("⚠️ asof merge still empty or labels missing. Falling back to nearest-neighbor labeling...")
-            feat_ts = features_df["timestamp"].to_numpy()
-            lab_ts = labeled["timestamp"].to_numpy()
-            if len(feat_ts) and len(lab_ts):
-                pos = np.searchsorted(lab_ts, feat_ts)
-                pos = np.clip(pos, 1, len(lab_ts)-1)
-                prev, nxt = lab_ts[pos-1], lab_ts[pos]
-                pick = np.where((feat_ts - prev) <= (nxt - feat_ts), prev, nxt)
-                nn_lab = labeled.set_index("timestamp").loc[pick, ["label","future_return"]].reset_index(drop=True)
-                final_dataset = pd.concat([features_df.reset_index(drop=True), nn_lab], axis=1)
-                print(f"✅ fallback merged rows = {len(final_dataset)}")
-            else:
-                final_dataset["label"] = np.nan
-                final_dataset["future_return"] = np.nan
+    # --- 5) 병합 ---
+    t5 = time.time()
+    if features_df is None or features_df.empty:
+        final_dataset = pd.DataFrame(columns=["timestamp", "label", "future_return"])
     else:
-        for c in ["label","future_return"]:
-            if c not in final_dataset.columns: final_dataset[c] = np.nan
-    t = _log_step("merge labels", t_merge)
+        f = features_df.sort_values("timestamp")
+        l = labeled.sort_values("timestamp")
+        final_dataset = pd.merge_asof(
+            f, l, on="timestamp", direction="nearest",
+            tolerance=pd.Timedelta(milliseconds=500)
+        )
+        if final_dataset is None or final_dataset.empty:
+            print("⚠️ merge_asof 결과가 비어 fallback nearest-neighbor labeling...")
+            lab_ts = l["timestamp"].to_numpy()
+            feat_ts = f["timestamp"].to_numpy()
+            if len(lab_ts) == 0 or len(feat_ts) == 0:
+                final_dataset = f.copy()
+                final_dataset["label"] = 0
+                final_dataset["future_return"] = 0.0
+            else:
+                pos = np.searchsorted(lab_ts, feat_ts)
+                pos = np.clip(pos, 1, len(lab_ts) - 1)
+                prev = lab_ts[pos - 1]
+                next = lab_ts[pos]
+                pick = np.where((feat_ts - prev) <= (next - feat_ts), prev, next)
+                nn_lab = l.set_index("timestamp").loc[pick, ["label", "future_return"]].reset_index(drop=True)
+                final_dataset = pd.concat([f.reset_index(drop=True), nn_lab], axis=1)
 
-    # 8) 저장
     final_dataset = final_dataset.loc[:, ~final_dataset.columns.duplicated(keep="first")]
-    os.makedirs(os.path.dirname(OUT_PATH), exist_ok=True)
-    final_dataset.to_parquet(OUT_PATH, index=False)
-    print("🎉 DONE:", OUT_PATH)
+    os.makedirs(os.path.dirname(args.out), exist_ok=True)
+    final_dataset.to_parquet(args.out, index=False)
+
+    print("⏳ merge labels done in {:.2f}s".format(time.time()-t5))
+    print(f"🎉 DONE: {args.out}")
     print("shape:", final_dataset.shape)
     print(final_dataset.head(3))
+    print("✅ ALL DONE in {:.2f}s (safemode={})".format(time.time()-t0, safemode))
 
-    T1 = time.perf_counter()
-    print(f"✅ ALL DONE in {T1 - T0:.2f}s (SAFE_MODE={SAFE_MODE}, window≈{SAFE_WINDOW_MIN}min)")
+
+if __name__ == "__main__":
+    main()
