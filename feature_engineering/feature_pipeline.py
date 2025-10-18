@@ -1,86 +1,66 @@
 import pandas as pd
-import numpy as np
-from typing import List, Optional
+
+from feature_engineering.trade_features import extract_trade_features  # 배치용(DataFrame 반환)
 from feature_engineering.orderbook_features import extract_orderbook_features
-from feature_engineering.trade_features import extract_trade_features
 from feature_engineering.technical_indicators import compute_technical_indicators
-from feature_engineering.external_features import build_external_features
 
 class BatchFeaturePipeline:
-    def __init__(self, timeframes: Optional[List[str]] = None):
-        self.timeframes = timeframes or ["0.5s","1s","5s"]
+    """
+    배치/백테스트용 피처 파이프라인
+      - base: OHLCV(1s)
+      - trades: extract_trade_features(trades_df, windows=("0.5s","1s","5s")) 한 번에
+      - depth : extract_orderbook_features(depth_df)  ← 전체 DataFrame 단위 호출
+      - tech  : compute_technical_indicators(base)
+      - external: (있으면) 1초 그리드 맞춰 join
+    """
+    def __init__(self, timeframes=("0.5s","1s","5s")):
+        self.timeframes = tuple(timeframes)
 
-    def build_features(
-        self,
-        ohlcv_df: pd.DataFrame,
-        trades_df: pd.DataFrame,
-        depth_df: pd.DataFrame,
-        external_df: Optional[pd.DataFrame] = None,  
-    ) -> pd.DataFrame:
-        if ohlcv_df is None or len(ohlcv_df)==0:
-            print("⚠️ [build_features] ohlcv empty"); return pd.DataFrame(columns=["timestamp"])
+    def build_features(self, ohlcv_df, trades_df, depth_df, external_df=None):
+        # --- 1) base (OHLCV 1s)
+        base = ohlcv_df.copy()
+        base["timestamp"] = pd.to_datetime(base["timestamp"], utc=True, errors="coerce")\
+                                .dt.tz_convert("UTC").dt.tz_localize(None)
+        base = base.dropna(subset=["timestamp"]).sort_values("timestamp").reset_index(drop=True)
 
-        # ts 표준화
-        for df in (ohlcv_df, trades_df, depth_df):
-            df["timestamp"] = pd.to_datetime(df["timestamp"], utc=True, errors="coerce")
-            df["timestamp"] = df["timestamp"].dt.tz_convert("UTC").dt.tz_localize(None)
-            df.sort_values("timestamp", inplace=True); df.dropna(subset=["timestamp"], inplace=True)
+        # --- 2) trade features (한 번에 계산해서 1s 그리드에 맞춰진 DF 받음)
+        try:
+            tr = extract_trade_features(trades_df, windows=self.timeframes)
+        except Exception as e:
+            print(f"[trade features] error: {e}")
+            tr = pd.DataFrame(columns=["timestamp"])
 
-        # 2) Trades (각 tf 그룹 → extract_trade_features)
-        tf_dfs = []
-        for tf in self.timeframes:
-            try:
-                grouped = trades_df.groupby(pd.Grouper(key="timestamp", freq=pd.to_timedelta(tf)))
-                rows = []
-                for ts,g in grouped:
-                    if len(g)==0: continue
-                    feats = extract_trade_features(g)
-                    feats["timestamp"] = ts
-                    rows.append(feats)
-                tf_df = pd.DataFrame(rows)
-                if not tf_df.empty:
-                    tf_df.rename(columns={c:f"{c}@{tf}" for c in tf_df.columns if c!="timestamp"}, inplace=True)
-                    tf_dfs.append(tf_df)
-            except Exception as e:
-                print(f"[trade tf {tf}] error:", e)
-        trade_feat_df = None
-        if tf_dfs:
-            trade_feat_df = tf_dfs[0]
-            for add in tf_dfs[1:]:
-                trade_feat_df = pd.merge(trade_feat_df, add, on="timestamp", how="outer")
-            trade_feat_df.sort_values("timestamp", inplace=True)
+        # --- 3) orderbook features (전체 DF 단위)  ← row별 dict로 돌리던 기존 방식 제거
+        try:
+            ob = extract_orderbook_features(depth_df)
+        except Exception as e:
+            print(f"[orderbook features] error: {e}")
+            ob = pd.DataFrame(columns=["timestamp"])
 
-        # 3) Orderbook
-        ob_rows = [ extract_orderbook_features(row._asdict() if hasattr(row,'_asdict') else row.to_dict())
-                    for _,row in depth_df.iterrows() ]
-        ob_df = pd.DataFrame(ob_rows) if ob_rows else pd.DataFrame(columns=["timestamp"])
+        # --- 4) technical indicators (base 위)
+        try:
+            ti = compute_technical_indicators(base)
+        except Exception as e:
+            print(f"[technicals] error: {e}")
+            ti = pd.DataFrame(columns=["timestamp"])
 
-        # 4) Technical
-        tech_df = compute_technical_indicators(ohlcv_df.copy())
+        # --- 5) external (이미 1s 그리드로 만들어져 있음)
+        ex = external_df if (external_df is not None and not external_df.empty) else pd.DataFrame(columns=["timestamp"])
 
-        # 5) Merge all (asof)
-        merged = ohlcv_df.copy()
-        for add in (trade_feat_df, ob_df, tech_df):
-            if add is not None and len(add)>0:
-                merged = pd.merge_asof(
-                    merged.sort_values("timestamp"),
-                    add.sort_values("timestamp"),
-                    on="timestamp", direction="nearest",
-                    tolerance=pd.Timedelta(seconds=3)
-                )
+        # --- 6) 순차 병합 (1초 타임라인 기준)
+        merged = base.merge(tr, on="timestamp", how="left")
+        merged = merged.merge(ob, on="timestamp", how="left")
+        merged = merged.merge(ti, on="timestamp", how="left")
+        if not ex.empty:
+            merged = merged.merge(ex, on="timestamp", how="left")
 
-        # ✅ 외부 피처 병합
-        if external_df is not None and not external_df.empty:
-            merged = pd.merge_asof(
-                merged.sort_values("timestamp"),
-                external_df.sort_values("timestamp"),
-                on="timestamp", direction="nearest",
-                tolerance=pd.Timedelta(seconds=3)
-            )
+        # --- 7) 최소한의 결측 보정
+        merged = merged.sort_values("timestamp").ffill().bfill()
 
-        merged = merged.loc[:, ~merged.columns.duplicated(keep="first")]
-        merged.fillna(method="ffill", inplace=True); merged.fillna(method="bfill", inplace=True)
-        if len(merged)==0:
-            merged = pd.DataFrame({"timestamp":[pd.Timestamp.utcnow().floor("s")]})
-        print(f"✅ [build_features] shape={merged.shape}")
+        # 숫자 컬럼만 남기려면 아래 주석 해제 (옵션)
+        # for c in merged.columns:
+        #     if c != "timestamp":
+        #         merged[c] = pd.to_numeric(merged[c], errors="coerce")
+        # merged = merged.fillna(0.0)
+
         return merged

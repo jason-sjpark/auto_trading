@@ -3,7 +3,7 @@ import numpy as np
 from typing import Dict, Optional
 
 from feature_engineering.orderbook_features import extract_orderbook_features
-from feature_engineering.trade_features import extract_trade_features
+from feature_engineering.trade_features import extract_trade_features_snapshot
 
 # ==============================================================
 # ⚙️ Feature Assembler
@@ -39,7 +39,7 @@ class FeatureAssembler:
         단일 시점의 orderbook + trade 데이터를 통합 피처셋으로 변환
         """
         ob_feats = extract_orderbook_features(orderbook_snapshot)
-        tr_feats = extract_trade_features(trades_df, prev_avg_vol)
+        tr_feats = extract_trade_features_snapshot(trades_df, prev_avg_vol)
 
         combined = {**ob_feats, **tr_feats}
         combined["timestamp"] = orderbook_snapshot.get("timestamp")

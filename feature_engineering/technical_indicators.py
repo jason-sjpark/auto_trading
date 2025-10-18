@@ -53,7 +53,7 @@ def compute_technical_indicators(df: pd.DataFrame) -> pd.DataFrame:
     df["momentum_5"]   = df["close"].pct_change(periods=5)
     df["volatility_5"] = df["close"].pct_change().rolling(window=5, min_periods=1).std()
 
-    df = df.dropna(subset=["timestamp"]).fillna(method="ffill").fillna(method="bfill")
+    df = df.dropna(subset=["timestamp"]).ffill().bfill()
     cols = ["timestamp","ema_9","ema_20","ema_50","rsi_14","vwap","atr_14",
             "bb_ma","bb_upper","bb_lower","bb_width","momentum_5","volatility_5"]
     return df[cols]

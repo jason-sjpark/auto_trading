@@ -180,8 +180,13 @@ def parse_trades_like_csv(df: pd.DataFrame, symbol: str, verbose: bool=False) ->
     tid = tid.fillna(-1).astype(np.int64)
 
     # isBuyerMaker
-    ibmcol = pick("isBuyerMaker", "m")
-    ibm = df[ibmcol].astype(bool) if ibmcol else (df.iloc[:,5].astype(bool) if df.shape[1] > 5 else pd.Series(False, index=df.index, dtype=bool))
+    ibmcol = pick("isBuyerMaker", "is_buyer_maker", "m")
+    def _to_bool_series(s):
+        if s is None:  # 열 자체가 없으면 False
+            return pd.Series(False, index=df.index, dtype=bool)
+        s = s.astype(str).str.strip().str.lower()
+        return s.isin(["true","1","t","y"])
+    ibm = _to_bool_series(df[ibmcol]) if ibmcol else pd.Series(False, index=df.index, dtype=bool)
 
     out = pd.DataFrame({
         "timestamp": ts,
@@ -384,7 +389,7 @@ def backfill_one_day(symbol: str, day: pd.Timestamp, tasks: List[str], make_ohlc
             print(f"[{used}] {ymd} rows={len(std)} → {outp}")
             if make_ohlcv and resample_ohlcv is not None and len(std) > 0:
                 ticks = std[["timestamp", "price", "qty"]]
-                ohlcv_1s = resample_ohlcv(ticks, freq="1S")
+                ohlcv_1s = resample_ohlcv(ticks, freq="1s")
                 ohlcv_out = PROC_DIR / f"ohlcv_1s_{ymd_nodash}.parquet"
                 _parquet_safe(ohlcv_1s, ohlcv_out)
                 print(f"[OHLCV 1s] {ymd} rows={len(ohlcv_1s)} → {ohlcv_out}")

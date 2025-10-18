@@ -1,56 +1,85 @@
-# data_feed/liquidations_ws.py
-import json, time, threading
+import json, time, sys
 from pathlib import Path
+from datetime import datetime
 import pandas as pd
-import websocket
+from websocket import WebSocketApp  # <-- 명시적 임포트 (websocket-client)
 
 ROOT = Path(__file__).resolve().parents[1]
-OUT_DIR = ROOT / "data" / "raw" / "liquidations_ws"
-OUT_DIR.mkdir(parents=True, exist_ok=True)
+OUT_ROOT = ROOT / "data" / "realtime" / "liquidations"
+OUT_ROOT.mkdir(parents=True, exist_ok=True)
 
-def _ts_to_naive_utc(ms: int):
+SYMBOL = "BTCUSDT"
+BUFFER_SIZE = 200
+FLUSH_INTERVAL_SEC = 10
+
+def _utc_ms_to_naive(ms: int) -> pd.Timestamp:
     return pd.to_datetime(ms, unit="ms", utc=True).tz_convert("UTC").tz_localize(None)
 
-def collect_liquidations(symbol="BTCUSDT"):
-    stream = f"wss://fstream.binance.com/ws/{symbol.lower()}@forceOrder"
+def _chunk_dir(symbol: str) -> Path:
+    day = datetime.utcnow().strftime("%Y-%m-%d")
+    d = OUT_ROOT / symbol / day
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+def _chunk_path(base_dir: Path) -> Path:
+    stamp = datetime.utcnow().strftime("%H%M%S")
+    seq = 0
+    while True:
+        p = base_dir / f"part-{stamp}-{seq:03d}.parquet"
+        if not p.exists():
+            return p
+        seq += 1
+
+def _flush(buffer, symbol: str):
+    if not buffer:
+        return
+    df = pd.DataFrame(buffer)
+    buffer.clear()
+    out = _chunk_path(_chunk_dir(symbol))
+    df.to_parquet(out, index=False, compression="snappy")
+    print(f"[WS] 💾 saved {len(df):,} rows → {out}")
+
+def collect_liquidations(symbol: str = SYMBOL):
+    url = f"wss://fstream.binance.com/ws/{symbol.lower()}@forceOrder"
     buffer = []
+    last_flush = time.monotonic()
 
     def on_message(ws, message):
+        nonlocal last_flush
         try:
             d = json.loads(message)
-            # 예시 페이로드: {'o': {'s': 'BTCUSDT','S': 'SELL','ap': '60234.12','q': '0.432','T': 1699999999999, ...}}
             o = d.get("o", {})
-            ts = _ts_to_naive_utc(o.get("T"))
+            ts = _utc_ms_to_naive(o.get("T"))
             side = str(o.get("S", "")).lower()
             price = pd.to_numeric(o.get("ap"), errors="coerce")
             qty   = pd.to_numeric(o.get("q"), errors="coerce")
-            row = {"timestamp": ts, "symbol": o.get("s"), "side": side, "price": price, "qty": qty}
-            buffer.append(row)
-            # 배치 저장 (예: 100건마다)
-            if len(buffer) >= 100:
-                df = pd.DataFrame(buffer)
-                buffer.clear()
-                out = OUT_DIR / f"{symbol}.parquet"
-                if out.exists():
-                    old = pd.read_parquet(out)
-                    df = pd.concat([old, df], ignore_index=True)
-                df = df.dropna(subset=["timestamp"]).sort_values("timestamp").drop_duplicates()
-                df.to_parquet(out, index=False)
-                print(f"[WS] saved {len(df)} rows → {out}")
+            buffer.append({"timestamp": ts, "symbol": o.get("s", symbol), "side": side, "price": price, "qty": qty})
+
+            if len(buffer) >= BUFFER_SIZE:
+                _flush(buffer, symbol)
+                last_flush = time.monotonic()
+
+            now = time.monotonic()
+            if now - last_flush >= FLUSH_INTERVAL_SEC:
+                _flush(buffer, symbol)
+                last_flush = now
         except Exception as e:
             print("parse err:", e)
 
+    def on_open(ws): print("ws open", url)
     def on_error(ws, err): print("ws err:", err)
-    def on_close(ws, a,b): print("ws closed")
-    def on_open(ws): print("ws open", stream)
+    def on_close(ws, a=None, b=None): print("ws closed")
 
     while True:
         try:
-            ws = websocket.WebSocketApp(stream, on_message=on_message, on_error=on_error, on_close=on_close, on_open=on_open)
+            ws = WebSocketApp(url, on_open=on_open, on_message=on_message, on_error=on_error, on_close=on_close)
             ws.run_forever(ping_interval=20, ping_timeout=10)
         except Exception as e:
             print("ws top-level err:", e)
+        finally:
+            _flush(buffer, symbol)
         time.sleep(2)
 
 if __name__ == "__main__":
-    collect_liquidations("BTCUSDT")
+    sym = SYMBOL if len(sys.argv) < 2 else sys.argv[1]
+    collect_liquidations(sym)

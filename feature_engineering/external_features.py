@@ -1,112 +1,92 @@
-# feature_engineering/external_features.py
 import pandas as pd
 import numpy as np
-from typing import Dict, Optional
 
-def _tz_norm(df: Optional[pd.DataFrame], tscol: str = "timestamp") -> pd.DataFrame:
-    if df is None or len(df) == 0:
-        return pd.DataFrame(columns=[tscol])
-    df = df.copy()
-    df[tscol] = pd.to_datetime(df[tscol], utc=True, errors="coerce")
-    df[tscol] = df[tscol].dt.tz_convert("UTC").dt.tz_localize(None)
-    df = df.dropna(subset=[tscol]).drop_duplicates(subset=[tscol]).sort_values(tscol)
-    return df
+EPS = 1e-12
 
-def _resample_to_seconds(df: pd.DataFrame, on: str = "timestamp") -> pd.DataFrame:
-    if df is None or df.empty:
-        return pd.DataFrame(columns=[on])
-    d = df.set_index(on).resample("1S").last().ffill().reset_index()
-    return d
+def _to_utc_naive(s):
+    s = pd.to_datetime(s, utc=True, errors="coerce")
+    return s.dt.tz_convert("UTC").dt.tz_localize(None)
 
-def _zscore(s: pd.Series, win: int) -> pd.Series:
-    m = s.rolling(win, min_periods=max(3, win//3)).mean()
-    v = s.rolling(win, min_periods=max(3, win//3)).std()
-    return (s - m) / (v.replace(0, np.nan))
-
-def build_external_features(ext: Dict[str, Optional[pd.DataFrame]]) -> pd.DataFrame:
+def _to_1s_index(df: pd.DataFrame, cols):
     """
-    ext keys (있으면 사용, 없으면 건너뜀):
-      - funding: ['timestamp','symbol','funding_rate']
-      - open_interest: ['timestamp','symbol','open_interest']
-      - long_short_ratio: ['timestamp','symbol','long_short_ratio','long_account','short_account']
-      - index_mark: ['timestamp','symbol','mark_price','index_price','last_funding_rate']
-      - liquidations: ['timestamp','symbol','side','price','qty']
-      - arbitrage: ['timestamp','symbol','binance_mark','okx_mark','arb_spread']
-    반환: 초 단위 표준화된 외부 피처 DF (timestamp 포함)
+    - timestamp → UTC-naive datetime
+    - 1초 리샘플(last) + ffill/bfill
+    - 반환: DatetimeIndex(초단위) 유지 (← 시간기반 rolling 가능)
     """
-    # ---------- 0) 개별 소스 정규화 ----------
-    fund = _tz_norm(ext.get("funding"))
-    oi   = _tz_norm(ext.get("open_interest"))
-    lsr  = _tz_norm(ext.get("long_short_ratio"))
-    im   = _tz_norm(ext.get("index_mark"))
-    liq  = _tz_norm(ext.get("liquidations"))
-    arb  = _tz_norm(ext.get("arbitrage"))
+    d = df.copy()
+    d["timestamp"] = _to_utc_naive(d["timestamp"])
+    for c in cols:
+        d[c] = pd.to_numeric(d[c], errors="coerce")
+    d = d.dropna(subset=["timestamp"]).sort_values("timestamp")
+    d = d.set_index("timestamp").resample("1s").last().ffill().bfill()
+    return d  # DatetimeIndex 그대로 유지
 
-    # ---------- 1) 각 소스 → 파생 피처 ----------
-    feats = []
-
-    if not fund.empty:
-        f = _resample_to_seconds(fund[["timestamp","funding_rate"]])
-        f["funding_rate_diff"] = f["funding_rate"].diff()
-        f["funding_rate_z"]    = _zscore(f["funding_rate"], 96)  # 8h @ 5m 기준 대략
-        feats.append(f)
-
-    if not oi.empty:
-        o = _resample_to_seconds(oi[["timestamp","open_interest"]])
-        o["oi_change"]     = o["open_interest"].diff()
-        o["oi_change_pct"] = o["open_interest"].pct_change()
-        o["oi_z"]          = _zscore(o["open_interest"], 600)  # ~10분 @ 1s
-        feats.append(o)
-
-    if not lsr.empty:
-        l = _resample_to_seconds(lsr[["timestamp","long_short_ratio","long_account","short_account"]])
-        l["lsr_z"] = _zscore(l["long_short_ratio"], 600)
-        feats.append(l)
-
-    if not im.empty:
-        m = _resample_to_seconds(im[["timestamp","mark_price","index_price"]])
-        m["basis_abs"]  = m["mark_price"] - m["index_price"]
-        m["basis_pct"]  = m["basis_abs"] / m["index_price"].replace(0, np.nan)
-        feats.append(m[["timestamp","basis_abs","basis_pct"]])
-
-    if not arb.empty:
-        a = _resample_to_seconds(arb[["timestamp","arb_spread"]])
-        a["arb_spread_z"] = _zscore(a["arb_spread"], 600)
-        feats.append(a)
-
-    if not liq.empty:
-        # 초 단위 합계/건수도 가능하지만 보통 청산은 듬성 → 1분 윈도우로 매끈하게
-        lq = liq.copy()
-        lq["count"] = 1
-        lq["notional"] = pd.to_numeric(lq.get("price"), errors="coerce") * pd.to_numeric(lq.get("qty"), errors="coerce")
-        lq = lq.set_index("timestamp").resample("1S").agg({
-            "qty":"sum", "count":"sum", "notional":"sum"
-        }).fillna(0.0).reset_index()
-        lq.rename(columns={
-            "qty":"liq_qty_1s", "count":"liq_count_1s", "notional":"liq_notional_1s"
-        }, inplace=True)
-        # 완충: 10초/60초 누적
-        lq["liq_qty_10s"]      = lq["liq_qty_1s"].rolling(10, min_periods=1).sum()
-        lq["liq_count_10s"]    = lq["liq_count_1s"].rolling(10, min_periods=1).sum()
-        lq["liq_notional_10s"] = lq["liq_notional_1s"].rolling(10, min_periods=1).sum()
-        lq["liq_qty_60s"]      = lq["liq_qty_1s"].rolling(60, min_periods=1).sum()
-        lq["liq_count_60s"]    = lq["liq_count_1s"].rolling(60, min_periods=1).sum()
-        lq["liq_notional_60s"] = lq["liq_notional_1s"].rolling(60, min_periods=1).sum()
-        feats.append(lq)
-
-    # ---------- 2) 병합 ----------
-    if not feats:
+def build_external_features(inputs: dict) -> pd.DataFrame:
+    """
+    inputs keys (optional):
+      funding(timestamp,symbol,funding_rate)
+      open_interest(timestamp,symbol,open_interest)
+      long_short_ratio(timestamp,symbol,long_short_ratio,long_account,short_account)
+      index_mark(timestamp,symbol,mark_price,index_price,last_funding_rate)
+      arbitrage(timestamp,symbol,binance_mark,okx_mark,arb_spread)
+      liquidations(...)  # 현재 미사용
+    """
+    # --- 베이스 타임라인(1초 그리드) 만들기
+    frames = []
+    for k, df in inputs.items():
+        if df is None or df.empty:
+            continue
+        d = df.copy()
+        d["timestamp"] = _to_utc_naive(d["timestamp"])
+        d = d.dropna(subset=["timestamp"])
+        frames.append(d[["timestamp"]])
+    if not frames:
         return pd.DataFrame(columns=["timestamp"])
-    out = feats[0]
-    for add in feats[1:]:
-        out = pd.merge_asof(
-            out.sort_values("timestamp"),
-            add.sort_values("timestamp"),
-            on="timestamp", direction="nearest",
-            tolerance=pd.Timedelta(seconds=3)
-        )
-    out = out.dropna(subset=["timestamp"]).sort_values("timestamp")
-    out = out.loc[:, ~out.columns.duplicated(keep="first")]
-    # 결측 보정
-    out = out.fillna(method="ffill").fillna(method="bfill")
+
+    base = pd.concat(frames, axis=0).drop_duplicates().sort_values("timestamp")
+    base = base.set_index("timestamp").resample("1s").last()
+    out = base.copy()  # DatetimeIndex 유지
+
+    # --- Funding rate: 1초 그리드 + zscore(정수윈도우=3600초)
+    fr = inputs.get("funding")
+    if fr is not None and not fr.empty:
+        fr1 = _to_1s_index(fr, ["funding_rate"])
+        win = 3600  # 3600초 = 1시간
+        mean = fr1["funding_rate"].rolling(win, min_periods=60).mean()
+        std  = fr1["funding_rate"].rolling(win, min_periods=60).std()
+        fr1["funding_rate_z"] = (fr1["funding_rate"] - mean) / (std + EPS)
+        out = out.join(fr1[["funding_rate","funding_rate_z"]], how="left")
+
+    # --- Open interest: 변화량/퍼센트 변화
+    oi = inputs.get("open_interest")
+    if oi is not None and not oi.empty:
+        oi1 = _to_1s_index(oi, ["open_interest"])
+        oi1["oi_change"]     = oi1["open_interest"].diff().fillna(0.0)
+        oi1["oi_change_pct"] = oi1["open_interest"].pct_change().replace([np.inf,-np.inf], np.nan).fillna(0.0)
+        out = out.join(oi1[["open_interest","oi_change","oi_change_pct"]], how="left")
+
+    # --- Long/Short ratio: zscore(1h=3600초)
+    lsr = inputs.get("long_short_ratio")
+    if lsr is not None and not lsr.empty:
+        lsr1 = _to_1s_index(lsr, ["long_short_ratio","long_account","short_account"])
+        win = 3600
+        mean = lsr1["long_short_ratio"].rolling(win, min_periods=60).mean()
+        std  = lsr1["long_short_ratio"].rolling(win, min_periods=60).std()
+        lsr1["lsr_z"] = (lsr1["long_short_ratio"] - mean) / (std + EPS)
+        out = out.join(lsr1[["long_short_ratio","long_account","short_account","lsr_z"]], how="left")
+
+    # --- Index/Mark
+    im = inputs.get("index_mark")
+    if im is not None and not im.empty:
+        im1 = _to_1s_index(im, ["mark_price","index_price","last_funding_rate"])
+        out = out.join(im1[["mark_price","index_price","last_funding_rate"]], how="left")
+
+    # --- Arbitrage
+    arb = inputs.get("arbitrage")
+    if arb is not None and not arb.empty:
+        arb1 = _to_1s_index(arb, ["binance_mark","okx_mark","arb_spread"])
+        out = out.join(arb1[["binance_mark","okx_mark","arb_spread"]], how="left")
+
+    # 최종 정리: index→column
+    out = out.sort_index().ffill().bfill().reset_index().rename(columns={"index":"timestamp"})
     return out
