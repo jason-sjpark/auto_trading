@@ -1,7 +1,7 @@
 import pandas as pd
 import numpy as np
 
-def resample_ohlcv(trades_or_ticks: pd.DataFrame, freq: str = "1S") -> pd.DataFrame:
+def resample_ohlcv(trades_or_ticks: pd.DataFrame, freq: str = "1s") -> pd.DataFrame:
     """
     입력: 최소 ['timestamp','price','qty']  (ticks/aggTrades)
     출력: ['timestamp','open','high','low','close','volume']
