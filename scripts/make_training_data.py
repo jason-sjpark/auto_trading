@@ -31,7 +31,7 @@ import pandas as pd
 import numpy as np
 
 # ===== 전역 스위치 =====
-safemode: bool = True   # ← 여기만 True/False 로 바꿔서 사용
+safemode: bool = False   # ← 여기만 True/False 로 바꿔서 사용
 
 # --- 로컬 모듈 ---
 from feature_engineering.feature_pipeline import BatchFeaturePipeline
@@ -361,6 +361,13 @@ def main():
     final_dataset = final_dataset.loc[:, ~final_dataset.columns.duplicated(keep="first")]
     os.makedirs(os.path.dirname(args.out), exist_ok=True)
     final_dataset.to_parquet(args.out, index=False)
+
+
+    # --- Quick quality report (optional) ---
+    critical_cols = ["spread","mid_price","orderbook_imbalance","liquidity_gap","wall_strength","depth_balance"]
+    null_rates = final_dataset[critical_cols].isna().mean().sort_values(ascending=False)
+    print("🧪 null rates (critical):")
+    print((null_rates*100).round(2).astype(str) + "%")
 
     print("⏳ merge labels done in {:.2f}s".format(time.time()-t5))
     print(f"🎉 DONE: {args.out}")

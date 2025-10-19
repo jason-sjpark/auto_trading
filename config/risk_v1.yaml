@@ -1,0 +1,19 @@
+risk_v: "1.0.0"
+window_ms: 1000
+q_ref_usdt: 10000
+alpha: 25
+beta: 7
+thr:
+  spread_bp: { good: 0.20, warn: 0.80, bad: 1.50 }
+  slip_bp: { good: 0.40, warn: 0.80, bad: 1.20 }
+  vol_3s_bp_bad: 6.0
+feed_lag_hard_ms: 500
+policy:
+  allow_max_risk: 35
+  caution_max_risk: 60
+  size_scale: { allow: 1.0, caution: 0.5, block: 0.0 }
+  order_type_hint:
+    {
+      allow: ["post-only", "marketable-limit"],
+      caution: ["post-only", "tight-limit"],
+    }

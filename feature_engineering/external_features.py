@@ -51,7 +51,7 @@ def build_external_features(inputs: Dict[str, pd.DataFrame],
     if oi is not None and not oi.empty:
         o = _to_1s_index(oi)
         if "open_interest" in o.columns:
-            o["open_interest"] = pd.to_numeric(o["open_interest"], errors="coerce").fillna(method="ffill").fillna(0.0)
+            o["open_interest"] = pd.to_numeric(o["open_interest"], errors="coerce").ffill().fillna(0.0)
             o["oi_change"] = o["open_interest"].diff().fillna(0.0)
             o["oi_change_pct"] = (o["open_interest"].pct_change().replace([np.inf, -np.inf], np.nan)).fillna(0.0)
             parts.append(o[["open_interest","oi_change","oi_change_pct"]])
@@ -65,7 +65,7 @@ def build_external_features(inputs: Dict[str, pd.DataFrame],
                 l[c] = pd.to_numeric(l[c], errors="coerce")
         # 1h 기준 Z
         if "long_short_ratio" in l.columns:
-            l["lsr_z"] = _zscore(l["long_short_ratio"].fillna(method="ffill").fillna(0.0), 3600)
+            l["lsr_z"] = _zscore(l["long_short_ratio"].ffill().fillna(0.0), 3600)
         parts.append(l[[c for c in ["long_short_ratio","long_account","short_account","lsr_z"] if c in l.columns]])
 
     # ---------- Index/Mark ----------

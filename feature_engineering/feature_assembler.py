@@ -2,7 +2,8 @@ import pandas as pd
 import numpy as np
 from typing import Dict, Optional
 
-from feature_engineering.orderbook_features import extract_orderbook_features
+# 변경: 스냅샷 전용 함수로 교체
+from feature_engineering.orderbook_features import extract_orderbook_features_snapshot
 from feature_engineering.trade_features import extract_trade_features_snapshot
 
 # ==============================================================
@@ -19,8 +20,6 @@ class FeatureAssembler:
     | `assemble_batch()` | 여러 시점 데이터를 DataFrame으로 결합                |
     | `normalize` 옵션     | 실시간 학습용 피처 정규화                           |
     | `dropna` 옵션        | NaN 자동 처리 (모델 안정성 강화)                    |
-
-
     """
 
     def __init__(self, normalize: bool = True, dropna: bool = True):
@@ -38,11 +37,13 @@ class FeatureAssembler:
         """
         단일 시점의 orderbook + trade 데이터를 통합 피처셋으로 변환
         """
-        ob_feats = extract_orderbook_features(orderbook_snapshot)
+        ob_feats = extract_orderbook_features_snapshot(orderbook_snapshot)
         tr_feats = extract_trade_features_snapshot(trades_df, prev_avg_vol)
 
         combined = {**ob_feats, **tr_feats}
-        combined["timestamp"] = orderbook_snapshot.get("timestamp")
+        # timestamp 보정
+        ts = orderbook_snapshot.get("timestamp")
+        combined["timestamp"] = pd.to_datetime(ts, errors="coerce")
 
         # 정규화
         if self.normalize:
@@ -50,7 +51,8 @@ class FeatureAssembler:
 
         # NaN 제거
         if self.dropna:
-            combined = {k: (0.0 if pd.isna(v) else v) for k, v in combined.items()}
+            combined = {k: (0.0 if (isinstance(v, float) and (pd.isna(v) or np.isinf(v))) else v)
+                        for k, v in combined.items()}
 
         return combined
 
@@ -61,16 +63,16 @@ class FeatureAssembler:
         """
         normalized = {}
         for k, v in feats.items():
-            if isinstance(v, (int, float)) and not pd.isna(v):
+            if isinstance(v, (int, float)) and not pd.isna(v) and not np.isinf(v):
                 if k not in self.feature_minmax:
-                    self.feature_minmax[k] = {"min": v, "max": v}
+                    self.feature_minmax[k] = {"min": float(v), "max": float(v)}
                 else:
-                    self.feature_minmax[k]["min"] = min(self.feature_minmax[k]["min"], v)
-                    self.feature_minmax[k]["max"] = max(self.feature_minmax[k]["max"], v)
+                    self.feature_minmax[k]["min"] = min(self.feature_minmax[k]["min"], float(v))
+                    self.feature_minmax[k]["max"] = max(self.feature_minmax[k]["max"], float(v))
 
                 vmin, vmax = self.feature_minmax[k]["min"], self.feature_minmax[k]["max"]
                 if vmax != vmin:
-                    normalized[k] = (v - vmin) / (vmax - vmin)
+                    normalized[k] = (float(v) - vmin) / (vmax - vmin)
                 else:
                     normalized[k] = 0.5
             else:
